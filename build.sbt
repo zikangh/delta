@@ -52,7 +52,7 @@ val all_scala_versions = Seq(scala212, scala213)
 val default_scala_version = settingKey[String]("Default Scala version")
 Global / default_scala_version := scala212
 
-val LATEST_RELEASED_SPARK_VERSION = "3.5.3"
+val LATEST_RELEASED_SPARK_VERSION = "3.5.7"
 val SPARK_MASTER_VERSION = "4.0.2-SNAPSHOT"
 val sparkVersion = settingKey[String]("Spark version")
 spark / sparkVersion := getSparkVersion()
@@ -727,7 +727,7 @@ lazy val kernelDefaults = (project in file("kernel/kernel-defaults"))
 lazy val kernelSpark = (project in file("kernel-spark"))
   .dependsOn(kernelApi)
   .dependsOn(kernelDefaults)
-  .dependsOn(spark % "test->test")
+  .dependsOn(spark % "compile->compile;test->test")
   .dependsOn(goldenTables % "test")
   .settings(
     name := "kernel-spark",
