@@ -25,11 +25,9 @@ import io.delta.kernel.commit.{CommitMetadata, CommitResponse, Committer}
 import io.delta.kernel.data.Row
 import io.delta.kernel.engine.Engine
 import io.delta.kernel.exceptions.KernelException
-import io.delta.kernel.internal.SnapshotImpl
 import io.delta.kernel.internal.actions.Protocol
 import io.delta.kernel.internal.commit.DefaultFileSystemManagedTableOnlyCommitter
-import io.delta.kernel.internal.files.ParsedLogData
-import io.delta.kernel.internal.files.ParsedLogData.ParsedLogType
+import io.delta.kernel.internal.files.{ParsedCatalogCommitData, ParsedLogData, ParsedPublishedDeltaData}
 import io.delta.kernel.internal.table.SnapshotBuilderImpl
 import io.delta.kernel.test.{ActionUtils, MockFileSystemClientUtils, MockSnapshotUtils, VectorTestUtils}
 import io.delta.kernel.types.{IntegerType, StructType}
@@ -124,18 +122,6 @@ class SnapshotBuilderSuite extends AnyFunSuite
     }.getMessage
 
     assert(exMsg === "protocol and metadata can only be provided if a version is provided")
-  }
-
-  test("atTimestamp: time travel by timestamp with logDatas throws UnsupportedOperationException") {
-    val builder = TableManager.loadSnapshot(dataPath.toString)
-      .atTimestamp(0L, mockSnapshotAtTimestamp0)
-      .withLogData(parsedRatifiedStagedCommits(Seq(0)).toList.asJava)
-
-    val exMsg = intercept[UnsupportedOperationException] {
-      builder.build(emptyMockEngine)
-    }.getMessage
-
-    assert(exMsg === "Time travel by timestamp with logDatas is not yet implemented")
   }
 
   // ===== Committer Tests ===== //
@@ -235,10 +221,11 @@ class SnapshotBuilderSuite extends AnyFunSuite
   }
 
   Seq(
-    ParsedLogData.forInlineData(1, ParsedLogType.RATIFIED_INLINE_COMMIT, emptyColumnarBatch),
+    ParsedCatalogCommitData.forInlineData(1, emptyColumnarBatch),
+    ParsedPublishedDeltaData.forFileStatus(deltaFileStatus(1, logPath)),
     ParsedLogData.forFileStatus(logCompactionStatus(0, 1))).foreach { parsedLogData =>
-    val suffix = s"- type=${parsedLogData.`type`}"
-    test(s"withLogData: non-RATIFIED_STAGED_COMMIT throws IllegalArgumentException $suffix") {
+    val suffix = s"- type=${parsedLogData.getClass.getSimpleName}"
+    test(s"withLogData: non-staged-ratified-commit throws IllegalArgumentException $suffix") {
       val builder = TableManager
         .loadSnapshot(dataPath.toString)
         .atVersion(1)
@@ -248,7 +235,7 @@ class SnapshotBuilderSuite extends AnyFunSuite
         builder.build(emptyMockEngine)
       }.getMessage
 
-      assert(exMsg.contains("Only RATIFIED_STAGED_COMMIT log data is supported"))
+      assert(exMsg.contains("Only staged ratified commits are supported"))
     }
   }
 

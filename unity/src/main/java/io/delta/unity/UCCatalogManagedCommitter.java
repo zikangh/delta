@@ -27,8 +27,10 @@ import io.delta.kernel.commit.CommitResponse;
 import io.delta.kernel.commit.Committer;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.engine.Engine;
+import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.annotation.VisibleForTesting;
-import io.delta.kernel.internal.files.ParsedLogData;
+import io.delta.kernel.internal.files.ParsedCatalogCommitData;
+import io.delta.kernel.internal.files.ParsedPublishedDeltaData;
 import io.delta.kernel.utils.CloseableIterator;
 import io.delta.kernel.utils.FileStatus;
 import io.delta.storage.commit.Commit;
@@ -49,9 +51,9 @@ import org.slf4j.LoggerFactory;
 public class UCCatalogManagedCommitter implements Committer {
   private static final Logger logger = LoggerFactory.getLogger(UCCatalogManagedCommitter.class);
 
-  private final UCClient ucClient;
-  private final String ucTableId;
-  private final Path tablePath;
+  protected final UCClient ucClient;
+  protected final String ucTableId;
+  protected final Path tablePath;
 
   /**
    * Creates a new UCCatalogManagedCommitter for the specified Unity Catalog-managed Delta table.
@@ -105,7 +107,8 @@ public class UCCatalogManagedCommitter implements Committer {
     final FileStatus kernelPublishedDeltaFileStatus =
         writeDeltaFile(engine, finalizedActions, commitMetadata.getPublishedDeltaFilePath());
 
-    return new CommitResponse(ParsedLogData.forFileStatus(kernelPublishedDeltaFileStatus));
+    return new CommitResponse(
+        ParsedPublishedDeltaData.forFileStatus(kernelPublishedDeltaFileStatus));
   }
 
   /**
@@ -123,7 +126,21 @@ public class UCCatalogManagedCommitter implements Committer {
 
     commitToUC(commitMetadata, kernelStagedCommitFileStatus);
 
-    return new CommitResponse(ParsedLogData.forFileStatus(kernelStagedCommitFileStatus));
+    return new CommitResponse(ParsedCatalogCommitData.forFileStatus(kernelStagedCommitFileStatus));
+  }
+
+  /////////////////////////////////////////
+  // Protected Methods for Extensibility //
+  /////////////////////////////////////////
+
+  /**
+   * Generates the metadata payload for UC commit operations.
+   *
+   * <p>This method allows subclasses to customize or enhance metadata before sending to Unity
+   * Catalog.
+   */
+  protected Optional<Metadata> generateMetadataPayloadOpt(CommitMetadata commitMetadata) {
+    return commitMetadata.getNewMetadataOpt();
   }
 
   ////////////////////
@@ -203,7 +220,7 @@ public class UCCatalogManagedCommitter implements Committer {
                 Optional.of(getUcCommitPayload(commitMetadata, kernelStagedCommitFileStatus)),
                 Optional.empty() /* lastKnownBackfilledVersion */, // TODO: take this in as a hint
                 false /* isDisown */,
-                commitMetadata.getNewMetadataOpt().map(MetadataAdapter::new),
+                generateMetadataPayloadOpt(commitMetadata).map(MetadataAdapter::new),
                 commitMetadata.getNewProtocolOpt().map(ProtocolAdapter::new));
             return null;
           } catch (io.delta.storage.commit.CommitFailedException cfe) {
