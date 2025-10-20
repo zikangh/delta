@@ -418,6 +418,7 @@ public class SparkMicroBatchStream implements MicroBatchStream {
         output.add(new IndexedFile(version, index++, addFile));
       }
     }
+
     return index;
   }
 }
