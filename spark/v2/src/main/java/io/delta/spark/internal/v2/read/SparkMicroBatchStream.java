@@ -823,18 +823,27 @@ public class SparkMicroBatchStream
     }
     // TODO(#5319): Implement ignoreChanges & skipChangeCommits & ignoreDeletes (legacy)
 
+    boolean seenFileAdd = false;
+    String removeFileActionPath = null;
+
     try (CloseableIterator<ColumnarBatch> actionsIter = commit.getActions()) {
       while (actionsIter.hasNext()) {
         ColumnarBatch batch = actionsIter.next();
         int numRows = batch.getSize();
         Metadata metadataAction = null;
         for (int rowId = 0; rowId < numRows; rowId++) {
-          // RULE 1: If commit has RemoveFile(dataChange=true), fail this stream.
+          // Check for AddFile with dataChange=true
+          Optional<AddFile> addOpt = StreamingHelper.getDataChangeAdd(batch, rowId);
+          if (addOpt.isPresent()) {
+            seenFileAdd = true;
+          }
+
+          // Check for RemoveFile with dataChange=true
           Optional<RemoveFile> removeOpt = StreamingHelper.getDataChangeRemove(batch, rowId);
           if (removeOpt.isPresent()) {
-            RemoveFile removeFile = removeOpt.get();
-            throw (RuntimeException)
-                DeltaErrors.deltaSourceIgnoreDeleteError(version, removeFile.getPath(), tablePath);
+            if (removeFileActionPath == null) {
+              removeFileActionPath = removeOpt.get().getPath();
+            }
           }
 
           // RULE 2: If commit has Metadata, check read-incompatible schema changes.
@@ -861,6 +870,19 @@ public class SparkMicroBatchStream
       }
     } catch (IOException e) {
       throw new RuntimeException("Failed to process commit at version " + version, e);
+    }
+
+    // After scanning all actions, determine what type of error to throw
+    if (removeFileActionPath != null) {
+      if (seenFileAdd) {
+        // Commit has both AddFile and RemoveFile (dataChange=true) - this is a "change"
+        throw (RuntimeException)
+            DeltaErrors.deltaSourceIgnoreChangesError(version, removeFileActionPath, tablePath);
+      } else {
+        // Commit has only RemoveFile (dataChange=true) - this is a "delete"
+        throw (RuntimeException)
+            DeltaErrors.deltaSourceIgnoreDeleteError(version, removeFileActionPath, tablePath);
+      }
     }
   }
 

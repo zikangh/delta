@@ -77,7 +77,11 @@ class DeltaV2SourceSuite extends DeltaSourceSuite with V2ForceTest {
     "maxBytesPerTrigger: max bytes and max files together",
     "startingVersion should work with rate time",
     "maxFilesPerTrigger: metadata checkpoint",
-    "maxBytesPerTrigger: metadata checkpoint"
+    "maxBytesPerTrigger: metadata checkpoint",
+
+    // ========== Error handling tests ==========
+    "SC-46515: deltaSourceIgnoreChangesError contains removeFile, version, tablePath",
+    "SC-46515: deltaSourceIgnoreDeleteError contains removeFile, version, tablePath"
   )
 
   private lazy val shouldFailTests = Set(
