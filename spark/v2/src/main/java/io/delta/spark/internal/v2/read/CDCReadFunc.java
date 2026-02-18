@@ -30,130 +30,202 @@ import scala.collection.Iterator;
 import scala.runtime.AbstractFunction1;
 
 /**
- * A ReadFunc decorator that overrides CDC metadata columns with per-file constants.
+ * CDC ReadFunc implementations that append CDC metadata columns to base Parquet reader output.
  *
- * <p>Wraps the base Parquet ReadFunc to intercept each file's iterator and override the CDC columns
- * (_change_type, _commit_version, _commit_timestamp) with constants extracted from {@link
- * PartitionedFile#otherConstantMetadataColumnValues()}. This follows the same decorator pattern
- * used for Deletion Vectors in DeltaParquetFileFormatBase.
+ * <p>Contains two ReadFunc types:
  *
- * <p>For each file, the decorator:
+ * <ul>
+ *   <li>{@link ExplicitCDCReadFunc} for explicit CDC files (AddCDCFile) where {@code _change_type}
+ *       is physically present in the Parquet data. Reorders {@code _change_type} to the end and
+ *       appends {@code _commit_version} and {@code _commit_timestamp}.
+ *   <li>{@link InferredCDCReadFunc} for inferred CDC (AddFile/RemoveFile with dataChange=true).
+ *       Appends all 3 CDC columns as constants.
+ * </ul>
  *
- * <ol>
- *   <li>Calls the delegate ReadFunc to get the base iterator
- *   <li>Extracts per-file CDC constants from the PartitionedFile metadata
- *   <li>Returns a CDCOverrideIterator that wraps each record with CDC column overrides
- * </ol>
+ * <p>Each ReadFunc wraps a base Parquet ReadFunc built with a type-appropriate schema and appends
+ * CDC columns at the end of each row/batch. This eliminates the dependency on Parquet schema
+ * evolution to populate null CDC column values.
  */
-public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<InternalRow>>
-    implements java.io.Serializable {
-  private final Function1<PartitionedFile, Iterator<InternalRow>> delegate;
-  private final int changeTypeColIndex;
-  private final int commitVersionColIndex;
-  private final int commitTimestampColIndex;
+public final class CDCReadFunc {
 
-  public CDCReadFunc(
-      Function1<PartitionedFile, Iterator<InternalRow>> delegate,
-      int changeTypeColIndex,
-      int commitVersionColIndex,
-      int commitTimestampColIndex) {
-    this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
-    this.changeTypeColIndex = changeTypeColIndex;
-    this.commitVersionColIndex = commitVersionColIndex;
-    this.commitTimestampColIndex = commitTimestampColIndex;
-  }
+  private CDCReadFunc() {} // utility/container class
 
-  @Override
-  public Iterator<InternalRow> apply(PartitionedFile file) {
-    Iterator<InternalRow> baseIterator = delegate.apply(file);
-    try {
-      // Extract per-file CDC constants from PartitionedFile metadata
-      scala.collection.immutable.Map<String, Object> constants =
-          file.otherConstantMetadataColumnValues();
+  /////////////////////////
+  // ReadFunc decorators //
+  /////////////////////////
 
-      Object changeType = constants.getOrElse(SparkMicroBatchStream.CDC_TYPE_COLUMN, () -> null);
-      UTF8String cdcChangeType =
-          changeType != null ? UTF8String.fromString(changeType.toString()) : null;
+  /**
+   * ReadFunc for explicit CDC files (AddCDCFile).
+   *
+   * <p>The base ReadFunc reads {@code [data_cols, _change_type, partition_cols]} because {@code
+   * _change_type} IS physically present in AddCDCFile Parquet files. This ReadFunc reorders {@code
+   * _change_type} to the end of the output and appends {@code _commit_version} and {@code
+   * _commit_timestamp}.
+   *
+   * <p>Output: {@code [data_cols, partition_cols, _change_type, _commit_version,
+   * _commit_timestamp]}
+   */
+  public static class ExplicitCDCReadFunc
+      extends AbstractFunction1<PartitionedFile, Iterator<InternalRow>>
+      implements java.io.Serializable {
+    private final Function1<PartitionedFile, Iterator<InternalRow>> delegate;
+    private final int changeTypeIndexInBase;
+    private final int numBaseFields;
 
-      Object commitVersion =
-          constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_VERSION, () -> null);
-      long cdcCommitVersion = commitVersion != null ? ((Number) commitVersion).longValue() : 0;
+    public ExplicitCDCReadFunc(
+        Function1<PartitionedFile, Iterator<InternalRow>> delegate,
+        int changeTypeIndexInBase,
+        int numBaseFields) {
+      this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
+      this.changeTypeIndexInBase = changeTypeIndexInBase;
+      this.numBaseFields = numBaseFields;
+    }
 
-      Object commitTimestamp =
-          constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP, () -> null);
-      long cdcCommitTimestampMicros =
-          commitTimestamp instanceof Timestamp
-              ? DateTimeUtils.fromJavaTimestamp((Timestamp) commitTimestamp)
-              : 0;
+    @Override
+    public Iterator<InternalRow> apply(PartitionedFile file) {
+      Iterator<InternalRow> baseIterator = delegate.apply(file);
+      try {
+        scala.collection.immutable.Map<String, Object> constants =
+            file.otherConstantMetadataColumnValues();
 
-      // CDCOverrideIterator uses Object as its element type to avoid JVM checkcast instructions
-      // that would fail when the base iterator produces ColumnarBatch (vectorized mode).
-      // The cast is safe due to type erasure — at runtime Iterator<InternalRow> and
-      // Iterator<Object> are the same type.
-      @SuppressWarnings("unchecked")
-      Iterator<InternalRow> result =
-          (Iterator<InternalRow>)
-              (Iterator<?>)
-                  new CDCOverrideIterator(
-                      baseIterator,
-                      changeTypeColIndex,
-                      commitVersionColIndex,
-                      commitTimestampColIndex,
-                      cdcChangeType,
-                      cdcCommitVersion,
-                      cdcCommitTimestampMicros);
-      return result;
-    } catch (Exception e) {
-      // On error during setup, close base iterator (following DV pattern's try-catch)
-      if (baseIterator instanceof AutoCloseable) {
-        try {
-          ((AutoCloseable) baseIterator).close();
-        } catch (Exception closeEx) {
-          e.addSuppressed(closeEx);
+        Object commitVersion =
+            constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_VERSION, () -> null);
+        long cdcCommitVersion = commitVersion != null ? ((Number) commitVersion).longValue() : 0;
+
+        Object commitTimestamp =
+            constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP, () -> null);
+        long cdcCommitTimestampMicros =
+            commitTimestamp instanceof Timestamp
+                ? DateTimeUtils.fromJavaTimestamp((Timestamp) commitTimestamp)
+                : 0;
+
+        @SuppressWarnings("unchecked")
+        Iterator<InternalRow> result =
+            (Iterator<InternalRow>)
+                (Iterator<?>)
+                    new CDCReorderAppendIterator(
+                        baseIterator,
+                        changeTypeIndexInBase,
+                        numBaseFields,
+                        cdcCommitVersion,
+                        cdcCommitTimestampMicros);
+        return result;
+      } catch (Exception e) {
+        if (baseIterator instanceof AutoCloseable) {
+          try {
+            ((AutoCloseable) baseIterator).close();
+          } catch (Exception closeEx) {
+            e.addSuppressed(closeEx);
+          }
         }
+        throw e;
       }
-      throw e;
     }
   }
 
   /**
-   * Iterator wrapper that overrides CDC columns in each record with per-file constants. Handles
-   * both row-based (InternalRow) and columnar (ColumnarBatch) records.
+   * ReadFunc for inferred CDC files (AddFile/RemoveFile with dataChange=true).
    *
-   * <p>Uses Object as element type to avoid JVM checkcast instructions — the ReadFunc signature
-   * uses Iterator&lt;InternalRow&gt; but vectorized mode actually produces ColumnarBatch elements.
+   * <p>The base ReadFunc reads {@code [data_cols, partition_cols]} with no CDC columns at all. This
+   * ReadFunc appends all 3 CDC columns as constants.
+   *
+   * <p>Output: {@code [data_cols, partition_cols, _change_type, _commit_version,
+   * _commit_timestamp]}
    */
-  static class CDCOverrideIterator extends scala.collection.AbstractIterator<Object>
+  public static class InferredCDCReadFunc
+      extends AbstractFunction1<PartitionedFile, Iterator<InternalRow>>
+      implements java.io.Serializable {
+    private final Function1<PartitionedFile, Iterator<InternalRow>> delegate;
+    private final int numBaseFields;
+    private final UTF8String fixedChangeType;
+
+    public InferredCDCReadFunc(
+        Function1<PartitionedFile, Iterator<InternalRow>> delegate,
+        int numBaseFields,
+        String fixedChangeType) {
+      this.delegate = java.util.Objects.requireNonNull(delegate, "delegate");
+      this.numBaseFields = numBaseFields;
+      this.fixedChangeType =
+          UTF8String.fromString(
+              java.util.Objects.requireNonNull(fixedChangeType, "fixedChangeType"));
+    }
+
+    @Override
+    public Iterator<InternalRow> apply(PartitionedFile file) {
+      Iterator<InternalRow> baseIterator = delegate.apply(file);
+      try {
+        scala.collection.immutable.Map<String, Object> constants =
+            file.otherConstantMetadataColumnValues();
+
+        Object commitVersion =
+            constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_VERSION, () -> null);
+        long cdcCommitVersion = commitVersion != null ? ((Number) commitVersion).longValue() : 0;
+
+        Object commitTimestamp =
+            constants.getOrElse(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP, () -> null);
+        long cdcCommitTimestampMicros =
+            commitTimestamp instanceof Timestamp
+                ? DateTimeUtils.fromJavaTimestamp((Timestamp) commitTimestamp)
+                : 0;
+
+        @SuppressWarnings("unchecked")
+        Iterator<InternalRow> result =
+            (Iterator<InternalRow>)
+                (Iterator<?>)
+                    new CDCAppendIterator(
+                        baseIterator,
+                        numBaseFields,
+                        fixedChangeType,
+                        cdcCommitVersion,
+                        cdcCommitTimestampMicros);
+        return result;
+      } catch (Exception e) {
+        if (baseIterator instanceof AutoCloseable) {
+          try {
+            ((AutoCloseable) baseIterator).close();
+          } catch (Exception closeEx) {
+            e.addSuppressed(closeEx);
+          }
+        }
+        throw e;
+      }
+    }
+  }
+
+  ///////////////
+  // Iterators //
+  ///////////////
+
+  /**
+   * Iterator for explicit CDC that reorders {@code _change_type} to the end and appends 2 constant
+   * columns ({@code _commit_version}, {@code _commit_timestamp}).
+   *
+   * <p>Base output: {@code [data_cols, _change_type, partition_cols]} (N fields)
+   *
+   * <p>This output: {@code [data_cols, partition_cols, _change_type, _commit_version,
+   * _commit_timestamp]} (N+2 fields)
+   */
+  static class CDCReorderAppendIterator extends scala.collection.AbstractIterator<Object>
       implements Closeable {
     private final Iterator<?> base;
-    private final int changeTypeColIndex;
-    private final int commitVersionColIndex;
-    private final int commitTimestampColIndex;
-    private final UTF8String cdcChangeType;
+    private final int changeTypeIndex;
+    private final int numBaseFields;
     private final long cdcCommitVersion;
     private final long cdcCommitTimestampMicros;
 
-    // Reusable wrapper row for overriding CDC columns (avoids per-row allocation)
-    private CDCOverrideRow cdcOverrideRow;
-
-    // Track constant vectors we create so we can close them (but NOT the reader's vectors)
-    private ColumnVector prevChangeTypeVector;
+    private CDCReorderAppendRow reorderAppendRow;
     private ColumnVector prevCommitVersionVector;
     private ColumnVector prevCommitTimestampVector;
 
-    CDCOverrideIterator(
+    CDCReorderAppendIterator(
         Iterator<?> base,
-        int changeTypeColIndex,
-        int commitVersionColIndex,
-        int commitTimestampColIndex,
-        UTF8String cdcChangeType,
+        int changeTypeIndex,
+        int numBaseFields,
         long cdcCommitVersion,
         long cdcCommitTimestampMicros) {
       this.base = base;
-      this.changeTypeColIndex = changeTypeColIndex;
-      this.commitVersionColIndex = commitVersionColIndex;
-      this.commitTimestampColIndex = commitTimestampColIndex;
-      this.cdcChangeType = cdcChangeType;
+      this.changeTypeIndex = changeTypeIndex;
+      this.numBaseFields = numBaseFields;
       this.cdcCommitVersion = cdcCommitVersion;
       this.cdcCommitTimestampMicros = cdcCommitTimestampMicros;
     }
@@ -167,10 +239,10 @@ public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<Int
     public Object next() {
       Object record = base.next();
       if (record instanceof ColumnarBatch) {
-        return overrideCDCColumnarBatch((ColumnarBatch) record);
+        return reorderAppendColumnarBatch((ColumnarBatch) record);
       }
       if (record instanceof InternalRow) {
-        return overrideCDCRow((InternalRow) record);
+        return reorderAppendRow((InternalRow) record);
       }
       return record;
     }
@@ -189,7 +261,126 @@ public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<Int
       }
     }
 
-    /** Close any constant vectors we created. Does NOT close the reader's internal vectors. */
+    private void closeConstantVectors() {
+      if (prevCommitVersionVector != null) {
+        prevCommitVersionVector.close();
+        prevCommitVersionVector = null;
+      }
+      if (prevCommitTimestampVector != null) {
+        prevCommitTimestampVector.close();
+        prevCommitTimestampVector = null;
+      }
+    }
+
+    private InternalRow reorderAppendRow(InternalRow dataRow) {
+      if (reorderAppendRow == null) {
+        reorderAppendRow = new CDCReorderAppendRow(changeTypeIndex, numBaseFields);
+      }
+      return reorderAppendRow.withRow(dataRow, cdcCommitVersion, cdcCommitTimestampMicros);
+    }
+
+    /**
+     * Reorder + append for columnar batch.
+     *
+     * <p>Base: {@code [vecs 0..C-1, vec_C(_change_type), vecs C+1..N-1]}
+     *
+     * <p>Output: {@code [vecs 0..C-1, vecs C+1..N-1, vec_C, const_cv_vec, const_cts_vec]}
+     */
+    private ColumnarBatch reorderAppendColumnarBatch(ColumnarBatch batch) {
+      int numRows = batch.numRows();
+      int numOutputCols = numBaseFields + 2;
+      ColumnVector[] vectors = new ColumnVector[numOutputCols];
+
+      // Data cols before _change_type
+      int outIdx = 0;
+      for (int i = 0; i < changeTypeIndex; i++) {
+        vectors[outIdx++] = batch.column(i);
+      }
+      // Partition cols (after _change_type in base)
+      for (int i = changeTypeIndex + 1; i < numBaseFields; i++) {
+        vectors[outIdx++] = batch.column(i);
+      }
+      // _change_type from Parquet (just referenced at new position, not copied)
+      vectors[outIdx++] = batch.column(changeTypeIndex);
+
+      // Close previous constant vectors before creating new ones
+      closeConstantVectors();
+
+      prevCommitVersionVector = createConstantLongVector(numRows, cdcCommitVersion);
+      vectors[outIdx++] = prevCommitVersionVector;
+      prevCommitTimestampVector = createConstantLongVector(numRows, cdcCommitTimestampMicros);
+      vectors[outIdx] = prevCommitTimestampVector;
+
+      return new ColumnarBatch(vectors, numRows);
+    }
+  }
+
+  /**
+   * Iterator for inferred CDC that appends 3 constant columns ({@code _change_type}, {@code
+   * _commit_version}, {@code _commit_timestamp}).
+   *
+   * <p>Base output: {@code [data_cols, partition_cols]} (N fields)
+   *
+   * <p>This output: {@code [data_cols, partition_cols, _change_type, _commit_version,
+   * _commit_timestamp]} (N+3 fields)
+   */
+  static class CDCAppendIterator extends scala.collection.AbstractIterator<Object>
+      implements Closeable {
+    private final Iterator<?> base;
+    private final int numBaseFields;
+    private final UTF8String cdcChangeType;
+    private final long cdcCommitVersion;
+    private final long cdcCommitTimestampMicros;
+
+    private CDCAppendRow appendRow;
+    private ColumnVector prevChangeTypeVector;
+    private ColumnVector prevCommitVersionVector;
+    private ColumnVector prevCommitTimestampVector;
+
+    CDCAppendIterator(
+        Iterator<?> base,
+        int numBaseFields,
+        UTF8String cdcChangeType,
+        long cdcCommitVersion,
+        long cdcCommitTimestampMicros) {
+      this.base = base;
+      this.numBaseFields = numBaseFields;
+      this.cdcChangeType = cdcChangeType;
+      this.cdcCommitVersion = cdcCommitVersion;
+      this.cdcCommitTimestampMicros = cdcCommitTimestampMicros;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return base.hasNext();
+    }
+
+    @Override
+    public Object next() {
+      Object record = base.next();
+      if (record instanceof ColumnarBatch) {
+        return appendColumnarBatch((ColumnarBatch) record);
+      }
+      if (record instanceof InternalRow) {
+        return appendRow((InternalRow) record);
+      }
+      return record;
+    }
+
+    @Override
+    public void close() throws IOException {
+      closeConstantVectors();
+      if (base instanceof AutoCloseable) {
+        try {
+          ((AutoCloseable) base).close();
+        } catch (IOException e) {
+          throw e;
+        } catch (Exception e) {
+          throw new IOException(e);
+        }
+      }
+    }
+
     private void closeConstantVectors() {
       if (prevChangeTypeVector != null) {
         prevChangeTypeVector.close();
@@ -205,103 +396,66 @@ public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<Int
       }
     }
 
-    private InternalRow overrideCDCRow(InternalRow dataRow) {
-      if (cdcOverrideRow == null) {
-        cdcOverrideRow =
-            new CDCOverrideRow(changeTypeColIndex, commitVersionColIndex, commitTimestampColIndex);
+    private InternalRow appendRow(InternalRow dataRow) {
+      if (appendRow == null) {
+        appendRow = new CDCAppendRow(numBaseFields);
       }
-      return cdcOverrideRow.withRow(
-          dataRow, cdcChangeType, cdcCommitVersion, cdcCommitTimestampMicros);
+      return appendRow.withRow(dataRow, cdcChangeType, cdcCommitVersion, cdcCommitTimestampMicros);
     }
 
-    /**
-     * Override CDC columns in a columnar batch with per-file constants.
-     *
-     * <p>Replaces null CDC ColumnVectors with constant-value OnHeapColumnVectors. The original
-     * vectors from the batch are NOT closed — they are owned by VectorizedParquetRecordReader which
-     * reuses them across batches. We only close the constant vectors we previously created.
-     */
-    private ColumnarBatch overrideCDCColumnarBatch(ColumnarBatch batch) {
+    /** Append 3 constant CDC columns to a columnar batch. */
+    private ColumnarBatch appendColumnarBatch(ColumnarBatch batch) {
       int numRows = batch.numRows();
-      int numCols = batch.numCols();
+      int numOutputCols = numBaseFields + 3;
+      ColumnVector[] vectors = new ColumnVector[numOutputCols];
 
-      ColumnVector[] vectors = new ColumnVector[numCols];
-      for (int i = 0; i < numCols; i++) {
+      // Copy all base vectors
+      for (int i = 0; i < numBaseFields; i++) {
         vectors[i] = batch.column(i);
       }
 
-      // Close constant vectors from the previous batch before creating new ones
+      // Close previous constant vectors before creating new ones
       closeConstantVectors();
 
-      if (changeTypeColIndex >= 0 && cdcChangeType != null) {
-        prevChangeTypeVector = createConstantStringVector(numRows, cdcChangeType);
-        vectors[changeTypeColIndex] = prevChangeTypeVector;
-      }
-
-      if (commitVersionColIndex >= 0) {
-        prevCommitVersionVector = createConstantLongVector(numRows, cdcCommitVersion);
-        vectors[commitVersionColIndex] = prevCommitVersionVector;
-      }
-
-      if (commitTimestampColIndex >= 0) {
-        prevCommitTimestampVector = createConstantLongVector(numRows, cdcCommitTimestampMicros);
-        vectors[commitTimestampColIndex] = prevCommitTimestampVector;
-      }
+      prevChangeTypeVector = createConstantStringVector(numRows, cdcChangeType);
+      vectors[numBaseFields] = prevChangeTypeVector;
+      prevCommitVersionVector = createConstantLongVector(numRows, cdcCommitVersion);
+      vectors[numBaseFields + 1] = prevCommitVersionVector;
+      prevCommitTimestampVector = createConstantLongVector(numRows, cdcCommitTimestampMicros);
+      vectors[numBaseFields + 2] = prevCommitTimestampVector;
 
       return new ColumnarBatch(vectors, numRows);
     }
   }
 
-  /** Create a constant Long ColumnVector with the given value for all rows. */
-  static ColumnVector createConstantLongVector(int numRows, long value) {
-    org.apache.spark.sql.execution.vectorized.OnHeapColumnVector vec =
-        new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(
-            numRows, org.apache.spark.sql.types.DataTypes.LongType);
-    for (int i = 0; i < numRows; i++) {
-      vec.putLong(i, value);
-    }
-    return vec;
-  }
-
-  /** Create a constant UTF8String ColumnVector with the given value for all rows. */
-  static ColumnVector createConstantStringVector(int numRows, UTF8String value) {
-    org.apache.spark.sql.execution.vectorized.OnHeapColumnVector vec =
-        new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(
-            numRows, org.apache.spark.sql.types.DataTypes.StringType);
-    byte[] bytes = value.getBytes();
-    for (int i = 0; i < numRows; i++) {
-      vec.putByteArray(i, bytes);
-    }
-    return vec;
-  }
+  //////////////////
+  // Row wrappers //
+  //////////////////
 
   /**
-   * A zero-copy InternalRow wrapper that overrides all 3 CDC columns with per-file constants.
+   * Zero-copy InternalRow wrapper for inferred CDC: appends 3 constant CDC columns.
    *
-   * <p>The Parquet reader produces rows with the full readDataSchema including CDC columns (filled
-   * with null via schema evolution). This wrapper overrides those null values with the per-file
-   * constants (_change_type, _commit_version, _commit_timestamp).
+   * <p>Ordinal mapping (N = numBaseFields):
    *
-   * <p>Key advantage over JoinedRow: same numFields as the delegate -- no column count mismatch.
-   *
-   * <p>This is reusable: call {@link #withRow} to set the delegate and values for each row.
+   * <pre>
+   * ordinal &lt; N    -> delegate.get(ordinal)       // data + partition cols
+   * ordinal == N   -> _change_type constant
+   * ordinal == N+1 -> _commit_version constant
+   * ordinal == N+2 -> _commit_timestamp constant
+   * </pre>
    */
-  static class CDCOverrideRow extends InternalRow {
-    private final int changeTypeOrdinal;
-    private final int commitVersionOrdinal;
-    private final int commitTimestampOrdinal;
+  static class CDCAppendRow extends InternalRow {
+    private final int numBaseFields;
     private InternalRow delegate;
     private UTF8String changeTypeValue;
     private long commitVersionValue;
     private long commitTimestampMicrosValue;
 
-    CDCOverrideRow(int changeTypeOrdinal, int commitVersionOrdinal, int commitTimestampOrdinal) {
-      this.changeTypeOrdinal = changeTypeOrdinal;
-      this.commitVersionOrdinal = commitVersionOrdinal;
-      this.commitTimestampOrdinal = commitTimestampOrdinal;
+    CDCAppendRow(int numBaseFields) {
+      this.numBaseFields = numBaseFields;
     }
 
-    CDCOverrideRow withRow(
+    CDCAppendRow withRow(
         InternalRow delegate,
         UTF8String changeTypeValue,
         long commitVersionValue,
@@ -315,35 +469,35 @@ public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<Int
 
     @Override
     public int numFields() {
-      return delegate.numFields();
+      return numBaseFields + 3;
     }
 
     @Override
     public boolean isNullAt(int ordinal) {
-      if (ordinal == changeTypeOrdinal) return changeTypeValue == null;
-      if (ordinal == commitVersionOrdinal) return false;
-      if (ordinal == commitTimestampOrdinal) return false;
-      return delegate.isNullAt(ordinal);
+      if (ordinal < numBaseFields) return delegate.isNullAt(ordinal);
+      if (ordinal == numBaseFields) return changeTypeValue == null;
+      return false; // _commit_version and _commit_timestamp are never null
     }
 
     @Override
     public Object get(int ordinal, DataType dataType) {
-      if (ordinal == changeTypeOrdinal) return changeTypeValue;
-      if (ordinal == commitVersionOrdinal) return commitVersionValue;
-      if (ordinal == commitTimestampOrdinal) return commitTimestampMicrosValue;
-      return delegate.get(ordinal, dataType);
+      if (ordinal < numBaseFields) return delegate.get(ordinal, dataType);
+      if (ordinal == numBaseFields) return changeTypeValue;
+      if (ordinal == numBaseFields + 1) return commitVersionValue;
+      if (ordinal == numBaseFields + 2) return commitTimestampMicrosValue;
+      throw new ArrayIndexOutOfBoundsException(ordinal);
     }
 
     @Override
     public UTF8String getUTF8String(int ordinal) {
-      if (ordinal == changeTypeOrdinal) return changeTypeValue;
+      if (ordinal == numBaseFields) return changeTypeValue;
       return delegate.getUTF8String(ordinal);
     }
 
     @Override
     public long getLong(int ordinal) {
-      if (ordinal == commitVersionOrdinal) return commitVersionValue;
-      if (ordinal == commitTimestampOrdinal) return commitTimestampMicrosValue;
+      if (ordinal == numBaseFields + 1) return commitVersionValue;
+      if (ordinal == numBaseFields + 2) return commitTimestampMicrosValue;
       return delegate.getLong(ordinal);
     }
 
@@ -434,11 +588,221 @@ public class CDCReadFunc extends AbstractFunction1<PartitionedFile, Iterator<Int
 
     @Override
     public InternalRow copy() {
-      CDCOverrideRow copied =
-          new CDCOverrideRow(changeTypeOrdinal, commitVersionOrdinal, commitTimestampOrdinal);
+      CDCAppendRow copied = new CDCAppendRow(numBaseFields);
       copied.withRow(
           delegate.copy(), changeTypeValue, commitVersionValue, commitTimestampMicrosValue);
       return copied;
     }
+  }
+
+  /**
+   * Zero-copy InternalRow wrapper for explicit CDC: reorders {@code _change_type} to the end and
+   * appends 2 constant columns.
+   *
+   * <p>The delegate has N fields with {@code _change_type} at index C. The output has N+2 fields:
+   *
+   * <pre>
+   * ordinal &lt; C       -> delegate.get(ordinal)      // data cols before _change_type
+   * C &lt;= ordinal &lt; N-1 -> delegate.get(ordinal + 1)  // partition cols, shifted past _change_type
+   * ordinal == N-1     -> delegate.get(C)            // _change_type from Parquet
+   * ordinal == N       -> _commit_version constant
+   * ordinal == N+1     -> _commit_timestamp constant
+   * </pre>
+   */
+  static class CDCReorderAppendRow extends InternalRow {
+    private final int changeTypeIndex; // C
+    private final int numBaseFields; // N
+    private InternalRow delegate;
+    private long commitVersionValue;
+    private long commitTimestampMicrosValue;
+
+    CDCReorderAppendRow(int changeTypeIndex, int numBaseFields) {
+      this.changeTypeIndex = changeTypeIndex;
+      this.numBaseFields = numBaseFields;
+    }
+
+    CDCReorderAppendRow withRow(
+        InternalRow delegate, long commitVersionValue, long commitTimestampMicrosValue) {
+      this.delegate = delegate;
+      this.commitVersionValue = commitVersionValue;
+      this.commitTimestampMicrosValue = commitTimestampMicrosValue;
+      return this;
+    }
+
+    @Override
+    public int numFields() {
+      return numBaseFields + 2;
+    }
+
+    /**
+     * Maps an output ordinal to the corresponding delegate ordinal. Returns -1 for appended CDC
+     * constant columns ({@code _commit_version}, {@code _commit_timestamp}) which are not in the
+     * delegate.
+     */
+    private int mapOrdinal(int ordinal) {
+      if (ordinal < changeTypeIndex) {
+        // Data cols: pass through directly
+        return ordinal;
+      } else if (ordinal < numBaseFields - 1) {
+        // Partition cols: shift +1 to skip _change_type in delegate
+        return ordinal + 1;
+      } else if (ordinal == numBaseFields - 1) {
+        // _change_type: map to its original position in delegate
+        return changeTypeIndex;
+      } else {
+        // CDC constants (_commit_version, _commit_timestamp): not in delegate
+        return -1;
+      }
+    }
+
+    @Override
+    public boolean isNullAt(int ordinal) {
+      int mapped = mapOrdinal(ordinal);
+      if (mapped >= 0) return delegate.isNullAt(mapped);
+      return false; // _commit_version and _commit_timestamp are never null
+    }
+
+    @Override
+    public Object get(int ordinal, DataType dataType) {
+      int mapped = mapOrdinal(ordinal);
+      if (mapped >= 0) return delegate.get(mapped, dataType);
+      if (ordinal == numBaseFields) return commitVersionValue;
+      if (ordinal == numBaseFields + 1) return commitTimestampMicrosValue;
+      throw new ArrayIndexOutOfBoundsException(ordinal);
+    }
+
+    @Override
+    public UTF8String getUTF8String(int ordinal) {
+      int mapped = mapOrdinal(ordinal);
+      if (mapped >= 0) return delegate.getUTF8String(mapped);
+      throw new ArrayIndexOutOfBoundsException(ordinal);
+    }
+
+    @Override
+    public long getLong(int ordinal) {
+      if (ordinal == numBaseFields) return commitVersionValue;
+      if (ordinal == numBaseFields + 1) return commitTimestampMicrosValue;
+      int mapped = mapOrdinal(ordinal);
+      return delegate.getLong(mapped);
+    }
+
+    @Override
+    public boolean getBoolean(int ordinal) {
+      return delegate.getBoolean(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public byte getByte(int ordinal) {
+      return delegate.getByte(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public short getShort(int ordinal) {
+      return delegate.getShort(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public int getInt(int ordinal) {
+      return delegate.getInt(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public float getFloat(int ordinal) {
+      return delegate.getFloat(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public double getDouble(int ordinal) {
+      return delegate.getDouble(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.sql.types.Decimal getDecimal(int ordinal, int precision, int scale) {
+      return delegate.getDecimal(mapOrdinal(ordinal), precision, scale);
+    }
+
+    @Override
+    public byte[] getBinary(int ordinal) {
+      return delegate.getBinary(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.CalendarInterval getInterval(int ordinal) {
+      return delegate.getInterval(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.VariantVal getVariant(int ordinal) {
+      return delegate.getVariant(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.GeographyVal getGeography(int ordinal) {
+      return delegate.getGeography(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.unsafe.types.GeometryVal getGeometry(int ordinal) {
+      return delegate.getGeometry(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public InternalRow getStruct(int ordinal, int numFields) {
+      return delegate.getStruct(mapOrdinal(ordinal), numFields);
+    }
+
+    @Override
+    public org.apache.spark.sql.catalyst.util.ArrayData getArray(int ordinal) {
+      return delegate.getArray(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public org.apache.spark.sql.catalyst.util.MapData getMap(int ordinal) {
+      return delegate.getMap(mapOrdinal(ordinal));
+    }
+
+    @Override
+    public void update(int ordinal, Object value) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void setNullAt(int ordinal) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public InternalRow copy() {
+      CDCReorderAppendRow copied = new CDCReorderAppendRow(changeTypeIndex, numBaseFields);
+      copied.withRow(delegate.copy(), commitVersionValue, commitTimestampMicrosValue);
+      return copied;
+    }
+  }
+
+  //////////////////////
+  // Utility methods  //
+  //////////////////////
+
+  /** Create a constant Long ColumnVector with the given value for all rows. */
+  static ColumnVector createConstantLongVector(int numRows, long value) {
+    org.apache.spark.sql.execution.vectorized.OnHeapColumnVector vec =
+        new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(
+            numRows, org.apache.spark.sql.types.DataTypes.LongType);
+    for (int i = 0; i < numRows; i++) {
+      vec.putLong(i, value);
+    }
+    return vec;
+  }
+
+  /** Create a constant UTF8String ColumnVector with the given value for all rows. */
+  static ColumnVector createConstantStringVector(int numRows, UTF8String value) {
+    org.apache.spark.sql.execution.vectorized.OnHeapColumnVector vec =
+        new org.apache.spark.sql.execution.vectorized.OnHeapColumnVector(
+            numRows, org.apache.spark.sql.types.DataTypes.StringType);
+    byte[] bytes = value.getBytes();
+    for (int i = 0; i < numRows; i++) {
+      vec.putByteArray(i, bytes);
+    }
+    return vec;
   }
 }

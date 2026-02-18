@@ -24,6 +24,7 @@ import io.delta.kernel.internal.actions.Protocol;
 import io.delta.kernel.internal.actions.RemoveFile;
 import io.delta.spark.internal.v2.read.CDCFileInfo;
 import io.delta.spark.internal.v2.read.CDCReadFunc;
+import io.delta.spark.internal.v2.read.CDCReaderFactory;
 import io.delta.spark.internal.v2.read.DeltaParquetFileFormatV2;
 import io.delta.spark.internal.v2.read.IndexedFile;
 import io.delta.spark.internal.v2.read.SparkMicroBatchStream;
@@ -313,6 +314,122 @@ public class PartitionUtils {
   }
 
   /**
+   * Create a {@link CDCReaderFactory} with type-specific ReadFuncs for CDC reads.
+   *
+   * <p>Builds TWO base Parquet ReadFuncs with different schemas:
+   *
+   * <ul>
+   *   <li>Explicit CDC (AddCDCFile): reads {@code dataOnlySchema + _change_type} because {@code
+   *       _change_type} IS physically present in AddCDCFile Parquet files
+   *   <li>Inferred CDC (AddFile/RemoveFile): reads {@code dataOnlySchema} only — no CDC columns
+   * </ul>
+   *
+   * <p>Each CDC ReadFunc wraps its base ReadFunc and appends CDC columns at the end of each
+   * row/batch. This eliminates the dependency on Parquet schema evolution to populate null values
+   * for missing CDC columns.
+   *
+   * @param snapshot The Delta table snapshot containing protocol, metadata, and table path
+   * @param readDataSchema Must be the data-only schema (no CDC columns — caller must strip them)
+   */
+  public static PartitionReaderFactory createCDCReaderFactory(
+      Snapshot snapshot,
+      StructType dataSchema,
+      StructType partitionSchema,
+      StructType readDataSchema,
+      Filter[] dataFilters,
+      scala.collection.immutable.Map<String, String> scalaOptions,
+      Configuration hadoopConf,
+      SQLConf sqlConf) {
+    SnapshotImpl snapshotImpl = (SnapshotImpl) snapshot;
+    Protocol protocol = snapshotImpl.getProtocol();
+    Metadata metadata = snapshotImpl.getMetadata();
+    String tablePath = snapshotImpl.getDataPath().toUri().toString();
+
+    // readDataSchema is dataOnlySchema (no CDC columns)
+    StructType dataOnlySchema = readDataSchema;
+
+    // Explicit CDC schema: data + _change_type (physically present in AddCDCFile Parquet)
+    StructType explicitSchema =
+        dataOnlySchema.add(
+            SparkMicroBatchStream.CDC_TYPE_COLUMN, org.apache.spark.sql.types.DataTypes.StringType);
+    StructType dataSchemaWithCT =
+        dataSchema.add(
+            SparkMicroBatchStream.CDC_TYPE_COLUMN, org.apache.spark.sql.types.DataTypes.StringType);
+
+    // Use explicit schema (the wider one) for vectorization check — if [data_cols, _change_type]
+    // supports vectorization, so does [data_cols] (a subset). Both base ReadFuncs must agree.
+    boolean enableVectorizedReader =
+        ParquetUtils.isBatchReadSupportedForSchema(sqlConf, explicitSchema);
+    scala.collection.immutable.Map<String, String> optionsWithVectorizedReading =
+        scalaOptions.$plus(
+            new Tuple2<>(
+                FileFormat$.MODULE$.OPTION_RETURNING_BATCH(),
+                String.valueOf(enableVectorizedReader)));
+
+    DeltaParquetFileFormatV2 deltaFormat =
+        new DeltaParquetFileFormatV2(
+            protocol,
+            metadata,
+            /* nullableRowTrackingConstantFields */ false,
+            /* nullableRowTrackingGeneratedFields */ false,
+            /* optimizationsEnabled */ true,
+            Option.apply(tablePath),
+            /* isCDCRead */ true,
+            /* useMetadataRowIndexOpt */ Option.empty());
+
+    // IMPORTANT: Each buildReaderWithPartitionValues call mutates the passed hadoopConf
+    // (via ParquetFileFormat.setupHadoopConf setting SPARK_ROW_REQUESTED_SCHEMA). In local
+    // mode, Spark's broadcast holds a reference to the same Configuration object, so the
+    // second call would overwrite the first call's schema. Use separate copies to avoid this.
+
+    // Explicit CDC base: reads data + _change_type from Parquet.
+    // Pass dataSchemaWithCT as the dataSchema param to avoid Parquet schema validation issues
+    // when requiredSchema (explicitSchema) has _change_type but dataSchema doesn't.
+    Function1<PartitionedFile, Iterator<InternalRow>> explicitBaseReadFunc =
+        deltaFormat.buildReaderWithPartitionValues(
+            SparkSession.active(),
+            dataSchemaWithCT,
+            partitionSchema,
+            explicitSchema,
+            CollectionConverters.asScala(Arrays.asList(dataFilters)).toSeq(),
+            optionsWithVectorizedReading,
+            new Configuration(hadoopConf));
+
+    // Inferred CDC base: reads data only (no CDC columns at all)
+    Function1<PartitionedFile, Iterator<InternalRow>> inferredBaseReadFunc =
+        deltaFormat.buildReaderWithPartitionValues(
+            SparkSession.active(),
+            dataSchema,
+            partitionSchema,
+            dataOnlySchema,
+            CollectionConverters.asScala(Arrays.asList(dataFilters)).toSeq(),
+            optionsWithVectorizedReading,
+            new Configuration(hadoopConf));
+
+    // Compute field indices and counts for CDC ReadFuncs
+    int changeTypeIndexInExplicit =
+        explicitSchema.fieldIndex(SparkMicroBatchStream.CDC_TYPE_COLUMN);
+    int numExplicitBaseFields = explicitSchema.fields().length + partitionSchema.fields().length;
+    int numInferredBaseFields = dataOnlySchema.fields().length + partitionSchema.fields().length;
+
+    // Create type-specific ReadFuncs
+    CDCReadFunc.ExplicitCDCReadFunc explicitReadFunc =
+        new CDCReadFunc.ExplicitCDCReadFunc(
+            explicitBaseReadFunc, changeTypeIndexInExplicit, numExplicitBaseFields);
+
+    CDCReadFunc.InferredCDCReadFunc inferredInsertReadFunc =
+        new CDCReadFunc.InferredCDCReadFunc(
+            inferredBaseReadFunc, numInferredBaseFields, SparkMicroBatchStream.CDC_TYPE_INSERT);
+
+    CDCReadFunc.InferredCDCReadFunc inferredDeleteReadFunc =
+        new CDCReadFunc.InferredCDCReadFunc(
+            inferredBaseReadFunc, numInferredBaseFields, SparkMicroBatchStream.CDC_TYPE_DELETE);
+
+    return new CDCReaderFactory(
+        explicitReadFunc, inferredInsertReadFunc, inferredDeleteReadFunc, enableVectorizedReader);
+  }
+
+  /**
    * Create a PartitionReaderFactory for reading Parquet files with Delta-specific features.
    *
    * <p>Uses DeltaParquetFileFormatV2 which supports column mapping, deletion vectors, and other
@@ -329,44 +446,11 @@ public class PartitionUtils {
       scala.collection.immutable.Map<String, String> scalaOptions,
       Configuration hadoopConf,
       SQLConf sqlConf) {
-    return createDeltaParquetReaderFactory(
-        snapshot,
-        dataSchema,
-        partitionSchema,
-        readDataSchema,
-        dataFilters,
-        scalaOptions,
-        hadoopConf,
-        sqlConf,
-        /* isCDCRead */ false);
-  }
-
-  /**
-   * Create a PartitionReaderFactory for reading Parquet files with Delta-specific features.
-   *
-   * <p>Uses DeltaParquetFileFormatV2 which supports column mapping, deletion vectors, and other
-   * Delta features through the ProtocolMetadataAdapterV2.
-   *
-   * @param snapshot The Delta table snapshot containing protocol, metadata, and table path
-   * @param isCDCRead Whether this is a CDC read (affects how data files are interpreted)
-   */
-  public static PartitionReaderFactory createDeltaParquetReaderFactory(
-      Snapshot snapshot,
-      StructType dataSchema,
-      StructType partitionSchema,
-      StructType readDataSchema,
-      Filter[] dataFilters,
-      scala.collection.immutable.Map<String, String> scalaOptions,
-      Configuration hadoopConf,
-      SQLConf sqlConf,
-      boolean isCDCRead) {
     SnapshotImpl snapshotImpl = (SnapshotImpl) snapshot;
     Protocol protocol = snapshotImpl.getProtocol();
     Metadata metadata = snapshotImpl.getMetadata();
     String tablePath = snapshotImpl.getDataPath().toUri().toString();
 
-    // CDC columns are now included in readDataSchema (filled with null by Parquet schema
-    // evolution, then overridden by CDCReadFunc), so vectorized reading works for CDC.
     boolean enableVectorizedReader =
         ParquetUtils.isBatchReadSupportedForSchema(sqlConf, readDataSchema);
     scala.collection.immutable.Map<String, String> optionsWithVectorizedReading =
@@ -384,10 +468,10 @@ public class PartitionUtils {
             /* nullableRowTrackingGeneratedFields */ false,
             /* optimizationsEnabled */ true,
             Option.apply(tablePath),
-            isCDCRead,
+            /* isCDCRead */ false,
             /* useMetadataRowIndexOpt */ Option.empty());
 
-    Function1<PartitionedFile, Iterator<InternalRow>> baseReadFunc =
+    Function1<PartitionedFile, Iterator<InternalRow>> readFunc =
         deltaFormat.buildReaderWithPartitionValues(
             SparkSession.active(),
             dataSchema,
@@ -396,31 +480,6 @@ public class PartitionUtils {
             CollectionConverters.asScala(Arrays.asList(dataFilters)).toSeq(),
             optionsWithVectorizedReading,
             hadoopConf);
-
-    // For CDC reads, wrap the base ReadFunc with CDCReadFunc to override CDC columns
-    // (_change_type, _commit_version, _commit_timestamp) with per-file constants.
-    // All 3 CDC columns are in readDataSchema (added by ensureCDCColumnsInSchema).
-    // For columns not physically in the parquet file, the Parquet reader fills them with null
-    // (schema evolution). CDCReadFunc overrides those nulls with per-file constants.
-    Function1<PartitionedFile, Iterator<InternalRow>> readFunc = baseReadFunc;
-    if (isCDCRead) {
-      int changeTypeColIndex = -1;
-      int commitVersionColIndex = -1;
-      int commitTimestampColIndex = -1;
-      for (int i = 0; i < readDataSchema.fields().length; i++) {
-        String name = readDataSchema.fields()[i].name();
-        if (name.equals(SparkMicroBatchStream.CDC_TYPE_COLUMN)) {
-          changeTypeColIndex = i;
-        } else if (name.equals(SparkMicroBatchStream.CDC_COMMIT_VERSION)) {
-          commitVersionColIndex = i;
-        } else if (name.equals(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP)) {
-          commitTimestampColIndex = i;
-        }
-      }
-      readFunc =
-          new CDCReadFunc(
-              baseReadFunc, changeTypeColIndex, commitVersionColIndex, commitTimestampColIndex);
-    }
 
     return new SparkReaderFactory(readFunc, enableVectorizedReader);
   }

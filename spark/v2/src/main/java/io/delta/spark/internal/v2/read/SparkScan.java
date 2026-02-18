@@ -136,8 +136,9 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
 
   /**
    * Read schema for the scan, which is the projection of data columns followed by partition
-   * columns. For CDC reads, all 3 CDC columns are ensured present via ensureCDCColumnsInSchema
-   * (deduplicating any that are already in readDataSchema from pruneColumns).
+   * columns. For CDC reads, CDC columns are stripped and re-appended at the end via
+   * buildCDCOutputSchema, ensuring they are always in a consistent tail position that matches the
+   * CDC ReadFunc output order.
    */
   @Override
   public StructType readSchema() {
@@ -148,11 +149,12 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
 
     StructType schema = new StructType(fields.toArray(new StructField[0]));
 
-    // For CDC reads, ensure all 3 CDC columns are present without duplication.
-    // Some may already be in readDataSchema (e.g., _change_type after pruneColumns),
-    // ensureCDCColumnsInSchema only appends missing ones.
+    // For CDC reads, strip any CDC columns (e.g., _change_type kept by pruneColumns)
+    // and re-append all 3 at the end. This guarantees the output order matches the
+    // CDC ReadFuncs: [data_cols, partition_cols, _change_type, _commit_version,
+    // _commit_timestamp].
     if (isCDCRead()) {
-      schema = SparkMicroBatchStream.ensureCDCColumnsInSchema(schema);
+      schema = SparkMicroBatchStream.buildCDCOutputSchema(schema);
     }
 
     return schema;

@@ -32,7 +32,7 @@ public class SparkPartitionReader<T> implements PartitionReader<T> {
   // Index of the next file to read within the partition.
   private int currentFileIndex = 0;
 
-  // Iterator returned by readFunc.apply(file). May be a CDCOverrideIterator (for CDC)
+  // Iterator returned by readFunc.apply(file). May be a CDC iterator (for CDC reads)
   // or a RecordReaderIterator (for non-CDC). We track Iterator<Object> because the actual
   // element type is either InternalRow or ColumnarBatch depending on vectorization.
   private Iterator<Object> currentIterator = null;

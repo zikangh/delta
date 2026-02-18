@@ -450,43 +450,43 @@ public class SparkMicroBatchStream
     boolean isInitialSnapshot = startOffset.isInitialSnapshot();
     boolean isCDCRead = options.readChangeFeed();
 
-    List<PartitionedFile> partitionedFiles = new ArrayList<>();
-    long totalBytesToRead = 0;
-
     CloseableIterator<IndexedFile> fileChanges =
         isCDCRead
             ? getFileChangesForCDC(
                 fromVersion, fromIndex, isInitialSnapshot, Optional.empty(), Optional.of(endOffset))
             : getFileChanges(fromVersion, fromIndex, isInitialSnapshot, Optional.of(endOffset));
 
+    if (isCDCRead) {
+      return planCDCPartitions(fileChanges, fromVersion, fromIndex, endOffset);
+    } else {
+      return planNonCDCPartitions(fileChanges, fromVersion, fromIndex, endOffset);
+    }
+  }
+
+  /**
+   * Plan input partitions for non-CDC reads. Collects AddFiles, bin-packs them into FilePartitions.
+   */
+  private InputPartition[] planNonCDCPartitions(
+      CloseableIterator<IndexedFile> fileChanges,
+      long fromVersion,
+      long fromIndex,
+      DeltaSourceOffset endOffset) {
+    List<PartitionedFile> partitionedFiles = new ArrayList<>();
+    long totalBytesToRead = 0;
+
     try (fileChanges) {
       while (fileChanges.hasNext()) {
         IndexedFile indexedFile = fileChanges.next();
-        if (!indexedFile.hasFileAction()) {
+        if (!indexedFile.hasFileAction() || indexedFile.getAddFile() == null) {
           continue;
         }
 
-        PartitionedFile partitionedFile;
-        if (isCDCRead) {
-          // Build PartitionedFile with CDC metadata columns
-          partitionedFile =
-              PartitionUtils.buildCDCPartitionedFile(
-                  indexedFile,
-                  partitionSchema,
-                  tablePath,
-                  ZoneId.of(sqlConf.sessionLocalTimeZone()));
-        } else {
-          // Non-CDC: must have AddFile
-          if (indexedFile.getAddFile() == null) {
-            continue;
-          }
-          partitionedFile =
-              PartitionUtils.buildPartitionedFile(
-                  indexedFile.getAddFile(),
-                  partitionSchema,
-                  tablePath,
-                  ZoneId.of(sqlConf.sessionLocalTimeZone()));
-        }
+        PartitionedFile partitionedFile =
+            PartitionUtils.buildPartitionedFile(
+                indexedFile.getAddFile(),
+                partitionSchema,
+                tablePath,
+                ZoneId.of(sqlConf.sessionLocalTimeZone()));
 
         totalBytesToRead += indexedFile.getFileSize();
         partitionedFiles.add(partitionedFile);
@@ -502,62 +502,153 @@ public class SparkMicroBatchStream
     long maxSplitBytes =
         PartitionUtils.calculateMaxSplitBytes(
             spark, totalBytesToRead, partitionedFiles.size(), sqlConf);
-    // Partitions files into Spark FilePartitions.
     Seq<FilePartition> filePartitions =
         FilePartition$.MODULE$.getFilePartitions(
             spark, JavaConverters.asScalaBuffer(partitionedFiles).toSeq(), maxSplitBytes);
     return JavaConverters.seqAsJavaList(filePartitions).toArray(new InputPartition[0]);
   }
 
+  /**
+   * Plan input partitions for CDC reads. Separates IndexedFiles into 3 groups by CDC type
+   * (explicit, inferred insert, inferred delete), bin-packs each group separately, and wraps each
+   * FilePartition in the corresponding {@link CDCInputPartition} subtype.
+   */
+  private InputPartition[] planCDCPartitions(
+      CloseableIterator<IndexedFile> fileChanges,
+      long fromVersion,
+      long fromIndex,
+      DeltaSourceOffset endOffset) {
+    List<PartitionedFile> explicitFiles = new ArrayList<>();
+    List<PartitionedFile> inferredInsertFiles = new ArrayList<>();
+    List<PartitionedFile> inferredDeleteFiles = new ArrayList<>();
+    long totalBytesToRead = 0;
+
+    try (fileChanges) {
+      while (fileChanges.hasNext()) {
+        IndexedFile indexedFile = fileChanges.next();
+        if (!indexedFile.hasFileAction()) {
+          continue;
+        }
+
+        PartitionedFile partitionedFile =
+            PartitionUtils.buildCDCPartitionedFile(
+                indexedFile, partitionSchema, tablePath, ZoneId.of(sqlConf.sessionLocalTimeZone()));
+        totalBytesToRead += indexedFile.getFileSize();
+
+        if (indexedFile.isCDCFile()) {
+          explicitFiles.add(partitionedFile);
+        } else if (indexedFile.getAddFile() != null) {
+          inferredInsertFiles.add(partitionedFile);
+        } else if (indexedFile.getRemoveFile() != null) {
+          inferredDeleteFiles.add(partitionedFile);
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeException(
+          String.format(
+              "Failed to get CDC file changes for table %s from version %d index %d to offset %s",
+              tablePath, fromVersion, fromIndex, endOffset),
+          e);
+    }
+
+    int totalFiles = explicitFiles.size() + inferredInsertFiles.size() + inferredDeleteFiles.size();
+    long maxSplitBytes =
+        PartitionUtils.calculateMaxSplitBytes(spark, totalBytesToRead, totalFiles, sqlConf);
+
+    List<InputPartition> result = new ArrayList<>();
+    binPackAndWrap(explicitFiles, maxSplitBytes, CDCInputPartition.Explicit::new, result);
+    binPackAndWrap(
+        inferredInsertFiles, maxSplitBytes, CDCInputPartition.InferredInsert::new, result);
+    binPackAndWrap(
+        inferredDeleteFiles, maxSplitBytes, CDCInputPartition.InferredDelete::new, result);
+    return result.toArray(new InputPartition[0]);
+  }
+
+  /**
+   * Bin-packs a list of PartitionedFiles into FilePartitions and wraps each in a typed
+   * CDCInputPartition.
+   */
+  private void binPackAndWrap(
+      List<PartitionedFile> files,
+      long maxSplitBytes,
+      java.util.function.Function<FilePartition, CDCInputPartition> wrapper,
+      List<InputPartition> output) {
+    if (files.isEmpty()) {
+      return;
+    }
+    Seq<FilePartition> filePartitions =
+        FilePartition$.MODULE$.getFilePartitions(
+            spark, JavaConverters.asScalaBuffer(files).toSeq(), maxSplitBytes);
+    for (FilePartition fp : JavaConverters.seqAsJavaList(filePartitions)) {
+      output.add(wrapper.apply(fp));
+    }
+  }
+
   @Override
   public PartitionReaderFactory createReaderFactory() {
     boolean isCDCRead = options.readChangeFeed();
 
-    // For CDC reads, augment readDataSchema with all 3 CDC columns so the Parquet reader
-    // includes them in its output schema. Columns not physically in the parquet file
-    // (e.g., _commit_version, _commit_timestamp, and _change_type for inferred CDC)
-    // are filled with null by schema evolution. CDCReadFunc overrides those nulls
-    // with per-file constants.
+    // For CDC reads, strip any CDC columns from readDataSchema so each base Parquet
+    // ReadFunc gets a type-appropriate schema (explicit reads data+_change_type,
+    // inferred reads data only). CDC columns are appended by the CDC ReadFuncs.
     StructType effectiveReadDataSchema =
-        isCDCRead ? ensureCDCColumnsInSchema(readDataSchema) : readDataSchema;
+        isCDCRead ? stripCDCColumns(readDataSchema) : readDataSchema;
 
-    return PartitionUtils.createDeltaParquetReaderFactory(
-        snapshotAtSourceInit,
-        dataSchema,
-        partitionSchema,
-        effectiveReadDataSchema,
-        dataFilters,
-        scalaOptions,
-        hadoopConf,
-        sqlConf,
-        isCDCRead);
+    if (isCDCRead) {
+      return PartitionUtils.createCDCReaderFactory(
+          snapshotAtSourceInit,
+          dataSchema,
+          partitionSchema,
+          effectiveReadDataSchema,
+          dataFilters,
+          scalaOptions,
+          hadoopConf,
+          sqlConf);
+    } else {
+      return PartitionUtils.createDeltaParquetReaderFactory(
+          snapshotAtSourceInit,
+          dataSchema,
+          partitionSchema,
+          effectiveReadDataSchema,
+          dataFilters,
+          scalaOptions,
+          hadoopConf,
+          sqlConf);
+    }
   }
 
   /**
-   * Ensures all 3 CDC columns are present in the schema. Appends any missing CDC column
-   * (_change_type, _commit_version, _commit_timestamp) without duplicating existing ones.
-   *
-   * <p>This is used to augment readDataSchema so the Parquet reader includes CDC columns in its
-   * output. For columns not physically present in the parquet file (e.g., _change_type for inferred
-   * CDC, _commit_version/_commit_timestamp always), the Parquet reader fills them with null via
-   * schema evolution. CDCReadFunc then overrides those nulls with per-file constants.
+   * Strips all 3 CDC columns ({@code _change_type}, {@code _commit_version}, {@code
+   * _commit_timestamp}) from a schema. Used to produce a data-only schema that each base Parquet
+   * ReadFunc receives, since CDC columns are appended by the CDC ReadFuncs rather than read from
+   * Parquet via schema evolution.
    */
-  static StructType ensureCDCColumnsInSchema(StructType schema) {
-    Set<String> existingFields = new HashSet<>();
+  static StructType stripCDCColumns(StructType schema) {
+    List<StructField> fields = new ArrayList<>();
     for (StructField field : schema.fields()) {
-      existingFields.add(field.name());
+      String name = field.name();
+      if (!name.equals(CDC_TYPE_COLUMN)
+          && !name.equals(CDC_COMMIT_VERSION)
+          && !name.equals(CDC_COMMIT_TIMESTAMP)) {
+        fields.add(field);
+      }
     }
-    StructType result = schema;
-    if (!existingFields.contains(CDC_TYPE_COLUMN)) {
-      result = result.add(CDC_TYPE_COLUMN, org.apache.spark.sql.types.DataTypes.StringType);
-    }
-    if (!existingFields.contains(CDC_COMMIT_VERSION)) {
-      result = result.add(CDC_COMMIT_VERSION, org.apache.spark.sql.types.DataTypes.LongType);
-    }
-    if (!existingFields.contains(CDC_COMMIT_TIMESTAMP)) {
-      result = result.add(CDC_COMMIT_TIMESTAMP, org.apache.spark.sql.types.DataTypes.TimestampType);
-    }
-    return result;
+    return new StructType(fields.toArray(new StructField[0]));
+  }
+
+  /**
+   * Builds the CDC output schema: strips CDC columns from the input, then appends all 3 CDC columns
+   * at the end. This guarantees CDC columns are always in a consistent position at the tail of the
+   * schema, matching the output order of the CDC ReadFuncs.
+   *
+   * <p>Used by both {@code readSchema()} and {@code createReaderFactory()} for consistency.
+   */
+  static StructType buildCDCOutputSchema(StructType schema) {
+    StructType stripped = stripCDCColumns(schema);
+    return stripped
+        .add(CDC_TYPE_COLUMN, org.apache.spark.sql.types.DataTypes.StringType)
+        .add(CDC_COMMIT_VERSION, org.apache.spark.sql.types.DataTypes.LongType)
+        .add(CDC_COMMIT_TIMESTAMP, org.apache.spark.sql.types.DataTypes.TimestampType);
   }
 
   ///////////////
