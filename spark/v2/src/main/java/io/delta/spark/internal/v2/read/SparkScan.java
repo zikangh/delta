@@ -59,12 +59,14 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
           Arrays.asList(
               DeltaOptions.STARTING_VERSION_OPTION(),
               DeltaOptions.MAX_FILES_PER_TRIGGER_OPTION(),
-              DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION()));
+              DeltaOptions.MAX_BYTES_PER_TRIGGER_OPTION(),
+              DeltaOptions.CDC_READ_OPTION(),
+              DeltaOptions.CDC_READ_OPTION_LEGACY()));
 
   /**
    * Block list of DeltaOptions that are not supported for streaming in V2 connector. Only
-   * startingVersion, maxFilesPerTrigger, and maxBytesPerTrigger are supported. User-defined custom
-   * options (not in DeltaOptions) are allowed to pass through.
+   * startingVersion, maxFilesPerTrigger, maxBytesPerTrigger, and readChangeFeed are supported.
+   * User-defined custom options (not in DeltaOptions) are allowed to pass through.
    */
   private static final Set<String> UNSUPPORTED_STREAMING_OPTIONS =
       Collections.unmodifiableSet(
@@ -77,8 +79,6 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
                   DeltaOptions.SKIP_CHANGE_COMMITS_OPTION().toLowerCase(),
                   DeltaOptions.FAIL_ON_DATA_LOSS_OPTION().toLowerCase(),
                   DeltaOptions.STARTING_TIMESTAMP_OPTION().toLowerCase(),
-                  DeltaOptions.CDC_READ_OPTION().toLowerCase(),
-                  DeltaOptions.CDC_READ_OPTION_LEGACY().toLowerCase(),
                   DeltaOptions.CDC_END_VERSION().toLowerCase(),
                   DeltaOptions.CDC_END_TIMESTAMP().toLowerCase(),
                   DeltaOptions.SCHEMA_TRACKING_LOCATION().toLowerCase(),
@@ -136,7 +136,8 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
 
   /**
    * Read schema for the scan, which is the projection of data columns followed by partition
-   * columns.
+   * columns. For CDC reads, all 3 CDC columns are ensured present via ensureCDCColumnsInSchema
+   * (deduplicating any that are already in readDataSchema from pruneColumns).
    */
   @Override
   public StructType readSchema() {
@@ -144,7 +145,26 @@ public class SparkScan implements Scan, SupportsReportStatistics, SupportsRuntim
         new ArrayList<>(readDataSchema.fields().length + partitionSchema.fields().length);
     Collections.addAll(fields, readDataSchema.fields());
     Collections.addAll(fields, partitionSchema.fields());
-    return new StructType(fields.toArray(new StructField[0]));
+
+    StructType schema = new StructType(fields.toArray(new StructField[0]));
+
+    // For CDC reads, ensure all 3 CDC columns are present without duplication.
+    // Some may already be in readDataSchema (e.g., _change_type after pruneColumns),
+    // ensureCDCColumnsInSchema only appends missing ones.
+    if (isCDCRead()) {
+      schema = SparkMicroBatchStream.ensureCDCColumnsInSchema(schema);
+    }
+
+    return schema;
+  }
+
+  /** Check if this is a CDC (Change Data Feed) read. */
+  boolean isCDCRead() {
+    String cdcOption = options.get(DeltaOptions.CDC_READ_OPTION());
+    if (cdcOption == null) {
+      cdcOption = options.get(DeltaOptions.CDC_READ_OPTION_LEGACY());
+    }
+    return "true".equalsIgnoreCase(cdcOption);
   }
 
   @Override

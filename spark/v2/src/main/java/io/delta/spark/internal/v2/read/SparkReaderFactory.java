@@ -26,8 +26,8 @@ import scala.Function1;
 import scala.collection.Iterator;
 
 public class SparkReaderFactory implements PartitionReaderFactory {
-  private Function1<PartitionedFile, Iterator<InternalRow>> readFunc;
-  private boolean supportsColumnar;
+  private final Function1<PartitionedFile, Iterator<InternalRow>> readFunc;
+  private final boolean supportsColumnar;
 
   public SparkReaderFactory(
       Function1<PartitionedFile, Iterator<InternalRow>> readFunc, boolean supportsColumnar) {
@@ -37,7 +37,7 @@ public class SparkReaderFactory implements PartitionReaderFactory {
 
   @Override
   public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
-    return new SparkPartitionReader<ColumnarBatch>(readFunc, (FilePartition) partition);
+    return new SparkPartitionReader<>(readFunc, (FilePartition) partition);
   }
 
   @Override
@@ -47,6 +47,6 @@ public class SparkReaderFactory implements PartitionReaderFactory {
 
   @Override
   public PartitionReader<InternalRow> createReader(InputPartition partition) {
-    return new SparkPartitionReader<InternalRow>(readFunc, (FilePartition) partition);
+    return new SparkPartitionReader<>(readFunc, (FilePartition) partition);
   }
 }

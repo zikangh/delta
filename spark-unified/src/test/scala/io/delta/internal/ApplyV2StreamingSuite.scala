@@ -140,4 +140,41 @@ class ApplyV2StreamingSuite extends DeltaSQLCommandTest {
       }
     }
   }
+
+  /** Build a path-based StreamingRelation (catalogTable = None). */
+  private def buildPathBasedStreamingRelation(path: String): LogicalPlan = {
+    val dataSource = DataSource(
+      sparkSession = spark,
+      userSpecifiedSchema = None,
+      className = "delta",
+      options = Map("path" -> path),
+      catalogTable = None)
+    StreamingRelation(dataSource)
+  }
+
+  test("ApplyV2Streaming converts path-based streaming relation in STRICT mode") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      createDeltaTable(path)
+      val plan = buildPathBasedStreamingRelation(path)
+
+      withSQLConf(DeltaSQLConf.V2_ENABLE_MODE.key -> "STRICT") {
+        val result = applyRule(plan)
+        assertV2(result)
+      }
+    }
+  }
+
+  test("ApplyV2Streaming leaves path-based streaming relation in NONE mode") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      createDeltaTable(path)
+      val plan = buildPathBasedStreamingRelation(path)
+
+      withSQLConf(DeltaSQLConf.V2_ENABLE_MODE.key -> "NONE") {
+        val result = applyRule(plan)
+        assertV1(result)
+      }
+    }
+  }
 }

@@ -21,6 +21,7 @@ import static io.delta.kernel.internal.util.Preconditions.checkState;
 import io.delta.kernel.CommitActions;
 import io.delta.kernel.data.ColumnVector;
 import io.delta.kernel.data.ColumnarBatch;
+import io.delta.kernel.data.MapValue;
 import io.delta.kernel.data.Row;
 import io.delta.kernel.engine.Engine;
 import io.delta.kernel.internal.DeltaLogActionUtils;
@@ -30,6 +31,7 @@ import io.delta.kernel.internal.actions.RemoveFile;
 import io.delta.kernel.internal.commitrange.CommitRangeImpl;
 import io.delta.kernel.internal.data.StructRow;
 import io.delta.kernel.utils.CloseableIterator;
+import io.delta.spark.internal.v2.read.CDCFileInfo;
 import java.util.Optional;
 import java.util.Set;
 import org.apache.spark.annotation.Experimental;
@@ -109,6 +111,63 @@ public class StreamingHelper {
     Metadata metadata = Metadata.fromColumnVector(metadataVector, rowId);
 
     return Optional.ofNullable(metadata);
+  }
+
+  /**
+   * Get RemoveFile action from a batch at the specified row, if present.
+   *
+   * <p>Note: This returns the RemoveFile regardless of its dataChange value. Use {@link
+   * #getDataChangeRemove} to filter for only data-changing removes.
+   */
+  public static Optional<RemoveFile> getRemoveFile(ColumnarBatch batch, int rowId) {
+    int removeIdx = getFieldIndex(batch, DeltaLogActionUtils.DeltaAction.REMOVE.colName);
+    ColumnVector removeVector = batch.getColumnVector(removeIdx);
+    if (removeVector.isNullAt(rowId)) {
+      return Optional.empty();
+    }
+
+    Row removeFileRow = StructRow.fromStructVector(removeVector, rowId);
+    checkState(
+        removeFileRow != null,
+        String.format("Failed to extract RemoveFile struct from batch at rowId=%d.", rowId));
+
+    return Optional.of(new RemoveFile(removeFileRow));
+  }
+
+  /**
+   * Get AddCDCFile (CDC file) from a batch at the specified row, if present.
+   *
+   * <p>Returns a CDCFileInfo wrapper containing the path, partition values, and size extracted from
+   * the CDC action column.
+   *
+   * @param batch the columnar batch containing actions
+   * @param rowId the row index to extract from
+   * @return Optional containing CDCFileInfo if CDC action is present, empty otherwise
+   */
+  public static Optional<CDCFileInfo> getCDCFile(ColumnarBatch batch, int rowId) {
+    int cdcIdx = batch.getSchema().indexOf(DeltaLogActionUtils.DeltaAction.CDC.colName);
+    if (cdcIdx < 0) {
+      // CDC column not in schema (not requested in action set)
+      return Optional.empty();
+    }
+
+    ColumnVector cdcVector = batch.getColumnVector(cdcIdx);
+    if (cdcVector.isNullAt(rowId)) {
+      return Optional.empty();
+    }
+
+    Row cdcRow = StructRow.fromStructVector(cdcVector, rowId);
+    checkState(
+        cdcRow != null,
+        String.format("Failed to extract CDC struct from batch at rowId=%d.", rowId));
+
+    // Extract fields from CDCFile row (see AddCDCFile.FULL_SCHEMA):
+    // path (string), partitionValues (map), size (long), tags (map, nullable)
+    String path = cdcRow.getString(0);
+    MapValue partitionValues = cdcRow.getMap(1);
+    long size = cdcRow.getLong(2);
+
+    return Optional.of(new CDCFileInfo(path, partitionValues, size));
   }
 
   /**

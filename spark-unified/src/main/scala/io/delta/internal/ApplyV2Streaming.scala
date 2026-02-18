@@ -21,7 +21,9 @@ import scala.jdk.OptionConverters._
 
 import io.delta.spark.internal.v2.catalog.SparkTable
 import io.delta.spark.internal.v2.utils.ScalaUtils
+import org.apache.spark.sql.delta.DeltaOptions
 import org.apache.spark.sql.delta.DeltaV2Mode
+import org.apache.spark.sql.delta.commands.cdc.CDCReader
 import org.apache.spark.sql.delta.sources.DeltaSourceUtils
 
 import org.apache.spark.sql.SparkSession
@@ -42,6 +44,12 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  * DeltaTableV2 doesn't advertise STREAMING_READ capability. We convert it back to
  * StreamingRelationV2 with SparkTable (from sparkV2) which does support streaming.
  *
+ * Additionally, for CDC (Change Data Feed) reads, this rule augments the output schema
+ * of StreamingRelationV2 with CDC metadata columns (_change_type, _commit_version,
+ * _commit_timestamp). This is necessary because Spark's MicroBatchExecution uses
+ * StreamingRelationV2.output as the schema for the streaming plan, and CDC columns
+ * are virtual (not in the table's stored schema).
+ *
  * See [[DeltaV2Mode]] for configuration behavior.
  *
  * @param session The Spark session for configuration access
@@ -58,7 +66,10 @@ class ApplyV2Streaming(
       case Some(catalogTable) =>
         DeltaSourceUtils.isDeltaDataSourceName(s.sourceName) ||
         catalogTable.provider.exists(DeltaSourceUtils.isDeltaDataSourceName)
-      case None => false
+      case None =>
+        // Path-based sources (.format("delta").load(path)) have no catalogTable.
+        // Check sourceName directly to identify Delta sources.
+        DeltaSourceUtils.isDeltaDataSourceName(s.sourceName)
     }
   }
 
@@ -71,36 +82,81 @@ class ApplyV2Streaming(
     deltaV2Mode.isStreamingReadsEnabled(s.dataSource.catalogTable.toJava)
   }
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperators {
-    case s: StreamingRelation if shouldApplyV2Streaming(s) =>
-      // catalogTable is guaranteed to be defined because shouldApplyV2Streaming checks it
-      // via isDeltaStreamingRelation.
-      val catalogTable = s.dataSource.catalogTable.get
-      val ident =
-        Identifier.of(catalogTable.identifier.database.toArray, catalogTable.identifier.table)
-      val table =
-        new SparkTable(
-          ident,
-          catalogTable,
-          // Use user-specified streaming options to override catalog storage properties.
-          // SparkTable handles merging catalogTable storage props internally.
-          ScalaUtils.toJavaMap(s.dataSource.options))
-      val catalog = catalogTable.identifier.catalog.map(
-        session.sessionState.catalogManager.catalog)
+  /** Check if options indicate a CDC read. */
+  private def isCDCRead(options: Map[String, String]): Boolean = {
+    options.get(DeltaOptions.CDC_READ_OPTION)
+      .orElse(options.get(DeltaOptions.CDC_READ_OPTION_LEGACY))
+      .exists(_.equalsIgnoreCase("true"))
+  }
 
+  /** Check if options indicate a CDC read (from CaseInsensitiveStringMap). */
+  private def isCDCRead(options: CaseInsensitiveStringMap): Boolean = {
+    val cdcOpt = Option(options.get(DeltaOptions.CDC_READ_OPTION))
+      .orElse(Option(options.get(DeltaOptions.CDC_READ_OPTION_LEGACY)))
+    cdcOpt.exists(_.equalsIgnoreCase("true"))
+  }
+
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperators {
+    // Case 1: V1 StreamingRelation (from .format("delta").load()) -> convert to V2
+    case s: StreamingRelation if shouldApplyV2Streaming(s) =>
+      val options = s.dataSource.options
+
+      // Build SparkTable + Identifier from either catalog table or path.
+      val (ident, table, catalog) = s.dataSource.catalogTable match {
+        case Some(ct) =>
+          val id = Identifier.of(ct.identifier.database.toArray, ct.identifier.table)
+          val tbl = new SparkTable(
+            id,
+            ct,
+            ScalaUtils.toJavaMap(options))
+          val cat = ct.identifier.catalog.map(
+            session.sessionState.catalogManager.catalog)
+          (id, tbl, cat)
+
+        case None =>
+          // Path-based source: extract path from DataSource options.
+          val path = options("path")
+          val id = Identifier.of(Array.empty, s"delta.`$path`")
+          val tbl = new SparkTable(id, path, ScalaUtils.toJavaMap(options))
+          (id, tbl, None)
+      }
+
+      // For CDC reads, augment schema with CDC metadata columns.
+      val outputSchema = if (isCDCRead(options)) {
+        CDCReader.cdcReadSchema(table.schema)
+      } else {
+        table.schema
+      }
 
       StreamingRelationV2(
-        // We rebuild this from the resolved V2 table, so there is no V1 source to carry through.
-        // This is only non-None when StreamingRelationV2 is created by wrapping a V1 streaming
-        // data source; in that case Spark keeps the underlying V1 DataSource instance here.
         source = None,
         sourceName = DeltaSourceUtils.NAME,
         table = table,
-        extraOptions = new CaseInsensitiveStringMap(s.dataSource.options.asJava),
-        output = toAttributes(table.schema),
+        extraOptions = new CaseInsensitiveStringMap(options.asJava),
+        output = toAttributes(outputSchema),
         catalog = catalog,
         identifier = Some(ident),
-        // Keep this None to force the V2 path; we don't want to fall back to V1 here.
         v1Relation = None)
+
+    // Case 2: V2 StreamingRelationV2 with SparkTable already resolved (from .table() path).
+    // Spark creates this directly when the table has MICRO_BATCH_READ capability.
+    // For CDC reads, we need to augment the output with CDC metadata columns since Spark's
+    // MicroBatchExecution uses StreamingRelationV2.output as-is (no column pruning for V2
+    // streaming), and CDC columns are virtual (not in the table's stored schema).
+    case s @ StreamingRelationV2(
+        _, _, _: SparkTable, options, output,
+        _, _, _)
+        if isCDCRead(options) && !hasCDCColumns(output) =>
+      val cdcCols = toAttributes(CDCReader.cdcReadSchema(
+        new org.apache.spark.sql.types.StructType()))
+      s.copy(output = output ++ cdcCols)
+  }
+
+  /** Check if output already has CDC columns (idempotency guard). */
+  private def hasCDCColumns(
+      output: Seq[
+        org.apache.spark.sql.catalyst.expressions.Attribute
+      ]): Boolean = {
+    output.exists(_.name == CDCReader.CDC_TYPE_COLUMN_NAME)
   }
 }

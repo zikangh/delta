@@ -87,6 +87,14 @@ public class SparkScanBuilder
     this.dataFilters = new Filter[0];
   }
 
+  /**
+   * CDC metadata column names that are always virtual (never in parquet files). Note: _change_type
+   * is NOT in this set because it IS present in explicit CDC files (_change_data/*.parquet) and
+   * must be read from the data.
+   */
+  private static final Set<String> CDC_VIRTUAL_METADATA_COLUMNS =
+      Set.of(SparkMicroBatchStream.CDC_COMMIT_VERSION, SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP);
+
   @Override
   public void pruneColumns(StructType requiredSchema) {
     requireNonNull(requiredSchema, "requiredSchema is null");
@@ -94,6 +102,7 @@ public class SparkScanBuilder
         new StructType(
             Arrays.stream(requiredSchema.fields())
                 .filter(f -> !partitionColumnSet.contains(f.name().toLowerCase(Locale.ROOT)))
+                .filter(f -> !CDC_VIRTUAL_METADATA_COLUMNS.contains(f.name()))
                 .toArray(StructField[]::new));
   }
 

@@ -21,8 +21,14 @@ import io.delta.kernel.internal.SnapshotImpl;
 import io.delta.kernel.internal.actions.AddFile;
 import io.delta.kernel.internal.actions.Metadata;
 import io.delta.kernel.internal.actions.Protocol;
+import io.delta.kernel.internal.actions.RemoveFile;
+import io.delta.spark.internal.v2.read.CDCFileInfo;
+import io.delta.spark.internal.v2.read.CDCReadFunc;
 import io.delta.spark.internal.v2.read.DeltaParquetFileFormatV2;
+import io.delta.spark.internal.v2.read.IndexedFile;
+import io.delta.spark.internal.v2.read.SparkMicroBatchStream;
 import io.delta.spark.internal.v2.read.SparkReaderFactory;
+import java.sql.Timestamp;
 import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -156,6 +162,157 @@ public class PartitionUtils {
   }
 
   /**
+   * Build a PartitionedFile for CDC with metadata columns injected as constants.
+   *
+   * <p>For explicit CDC files: read from _change_data/ directory. For inferred CDC: read from data
+   * files with injected _change_type.
+   *
+   * @param indexedFile The IndexedFile containing CDC information
+   * @param partitionSchema The partition schema
+   * @param tablePath The table path
+   * @param zoneId The timezone for temporal partition values
+   * @return A PartitionedFile ready for CDC read
+   */
+  public static PartitionedFile buildCDCPartitionedFile(
+      IndexedFile indexedFile, StructType partitionSchema, String tablePath, ZoneId zoneId) {
+
+    // Build constant CDC metadata columns
+    Map<String, Object> constantMetadataColumns = new HashMap<>();
+    constantMetadataColumns.put(SparkMicroBatchStream.CDC_COMMIT_VERSION, indexedFile.getVersion());
+    constantMetadataColumns.put(
+        SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP,
+        new Timestamp(indexedFile.getCommitTimestamp()));
+
+    if (indexedFile.isCDCFile()) {
+      // Explicit CDC file - _change_type is in the data, no need to inject
+      CDCFileInfo cdcFile = indexedFile.getCdcFile();
+      return buildPartitionedFileFromCDCFile(
+          cdcFile, partitionSchema, tablePath, zoneId, constantMetadataColumns);
+    } else if (indexedFile.getAddFile() != null) {
+      // Inferred CDC from AddFile - inject _change_type as constant
+      constantMetadataColumns.put(
+          SparkMicroBatchStream.CDC_TYPE_COLUMN, indexedFile.getChangeType());
+      return buildPartitionedFileWithConstants(
+          indexedFile.getAddFile(), partitionSchema, tablePath, zoneId, constantMetadataColumns);
+    } else if (indexedFile.getRemoveFile() != null) {
+      // Inferred CDC from RemoveFile - inject _change_type as constant
+      constantMetadataColumns.put(
+          SparkMicroBatchStream.CDC_TYPE_COLUMN, indexedFile.getChangeType());
+      return buildPartitionedFileFromRemove(
+          indexedFile.getRemoveFile(), partitionSchema, tablePath, zoneId, constantMetadataColumns);
+    } else {
+      throw new IllegalStateException(
+          "IndexedFile for CDC must have cdcFile, addFile, or removeFile");
+    }
+  }
+
+  /** Build PartitionedFile from an explicit CDC file (AddCDCFile). */
+  private static PartitionedFile buildPartitionedFileFromCDCFile(
+      CDCFileInfo cdcFile,
+      StructType partitionSchema,
+      String tablePath,
+      ZoneId zoneId,
+      Map<String, Object> constantMetadataColumns) {
+
+    InternalRow partitionRow =
+        getPartitionRow(cdcFile.getPartitionValues(), partitionSchema, zoneId);
+
+    String[] preferredLocations = new String[0];
+
+    // Convert constant metadata columns to Scala immutable map
+    scala.collection.immutable.Map<String, Object> scalaConstants =
+        convertToScalaImmutableMap(constantMetadataColumns);
+
+    return new PartitionedFile(
+        partitionRow,
+        SparkPath.fromUrlString(new Path(tablePath, cdcFile.getPath()).toString()),
+        /* start= */ 0L,
+        /* length= */ cdcFile.getSize(),
+        preferredLocations,
+        /* modificationTime= */ 0L, // CDC files don't have modification time
+        /* fileSize= */ cdcFile.getSize(),
+        scalaConstants);
+  }
+
+  /** Build PartitionedFile from AddFile with constant metadata columns. */
+  private static PartitionedFile buildPartitionedFileWithConstants(
+      AddFile addFile,
+      StructType partitionSchema,
+      String tablePath,
+      ZoneId zoneId,
+      Map<String, Object> constantMetadataColumns) {
+
+    InternalRow partitionRow =
+        getPartitionRow(addFile.getPartitionValues(), partitionSchema, zoneId);
+
+    String[] preferredLocations = new String[0];
+
+    scala.collection.immutable.Map<String, Object> scalaConstants =
+        convertToScalaImmutableMap(constantMetadataColumns);
+
+    return new PartitionedFile(
+        partitionRow,
+        SparkPath.fromUrlString(new Path(tablePath, addFile.getPath()).toString()),
+        /* start= */ 0L,
+        /* length= */ addFile.getSize(),
+        preferredLocations,
+        addFile.getModificationTime(),
+        /* fileSize= */ addFile.getSize(),
+        scalaConstants);
+  }
+
+  /** Build PartitionedFile from RemoveFile with constant metadata columns. */
+  private static PartitionedFile buildPartitionedFileFromRemove(
+      RemoveFile removeFile,
+      StructType partitionSchema,
+      String tablePath,
+      ZoneId zoneId,
+      Map<String, Object> constantMetadataColumns) {
+
+    // RemoveFile partition values are optional
+    InternalRow partitionRow =
+        removeFile
+            .getPartitionValues()
+            .map(pv -> getPartitionRow(pv, partitionSchema, zoneId))
+            .orElseGet(
+                () ->
+                    InternalRow.fromSeq(
+                        CollectionConverters.asScala(
+                                Arrays.asList(new Object[partitionSchema.fields().length])
+                                    .iterator())
+                            .toSeq()));
+
+    String[] preferredLocations = new String[0];
+
+    scala.collection.immutable.Map<String, Object> scalaConstants =
+        convertToScalaImmutableMap(constantMetadataColumns);
+
+    long fileSize = removeFile.getSize().orElse(0L);
+
+    return new PartitionedFile(
+        partitionRow,
+        SparkPath.fromUrlString(new Path(tablePath, removeFile.getPath()).toString()),
+        /* start= */ 0L,
+        /* length= */ fileSize,
+        preferredLocations,
+        removeFile.getDeletionTimestamp().orElse(0L),
+        /* fileSize= */ fileSize,
+        scalaConstants);
+  }
+
+  /** Convert Java Map to Scala immutable Map. */
+  @SuppressWarnings("unchecked")
+  private static scala.collection.immutable.Map<String, Object> convertToScalaImmutableMap(
+      Map<String, Object> javaMap) {
+    scala.collection.immutable.Map<String, Object> result =
+        scala.collection.immutable.Map$.MODULE$.empty();
+    for (Map.Entry<String, Object> entry : javaMap.entrySet()) {
+      result = result.$plus(new Tuple2<>(entry.getKey(), entry.getValue()));
+    }
+    return result;
+  }
+
+  /**
    * Create a PartitionReaderFactory for reading Parquet files with Delta-specific features.
    *
    * <p>Uses DeltaParquetFileFormatV2 which supports column mapping, deletion vectors, and other
@@ -172,11 +329,44 @@ public class PartitionUtils {
       scala.collection.immutable.Map<String, String> scalaOptions,
       Configuration hadoopConf,
       SQLConf sqlConf) {
+    return createDeltaParquetReaderFactory(
+        snapshot,
+        dataSchema,
+        partitionSchema,
+        readDataSchema,
+        dataFilters,
+        scalaOptions,
+        hadoopConf,
+        sqlConf,
+        /* isCDCRead */ false);
+  }
+
+  /**
+   * Create a PartitionReaderFactory for reading Parquet files with Delta-specific features.
+   *
+   * <p>Uses DeltaParquetFileFormatV2 which supports column mapping, deletion vectors, and other
+   * Delta features through the ProtocolMetadataAdapterV2.
+   *
+   * @param snapshot The Delta table snapshot containing protocol, metadata, and table path
+   * @param isCDCRead Whether this is a CDC read (affects how data files are interpreted)
+   */
+  public static PartitionReaderFactory createDeltaParquetReaderFactory(
+      Snapshot snapshot,
+      StructType dataSchema,
+      StructType partitionSchema,
+      StructType readDataSchema,
+      Filter[] dataFilters,
+      scala.collection.immutable.Map<String, String> scalaOptions,
+      Configuration hadoopConf,
+      SQLConf sqlConf,
+      boolean isCDCRead) {
     SnapshotImpl snapshotImpl = (SnapshotImpl) snapshot;
     Protocol protocol = snapshotImpl.getProtocol();
     Metadata metadata = snapshotImpl.getMetadata();
     String tablePath = snapshotImpl.getDataPath().toUri().toString();
 
+    // CDC columns are now included in readDataSchema (filled with null by Parquet schema
+    // evolution, then overridden by CDCReadFunc), so vectorized reading works for CDC.
     boolean enableVectorizedReader =
         ParquetUtils.isBatchReadSupportedForSchema(sqlConf, readDataSchema);
     scala.collection.immutable.Map<String, String> optionsWithVectorizedReading =
@@ -194,10 +384,10 @@ public class PartitionUtils {
             /* nullableRowTrackingGeneratedFields */ false,
             /* optimizationsEnabled */ true,
             Option.apply(tablePath),
-            /* isCDCRead */ false,
+            isCDCRead,
             /* useMetadataRowIndexOpt */ Option.empty());
 
-    Function1<PartitionedFile, Iterator<InternalRow>> readFunc =
+    Function1<PartitionedFile, Iterator<InternalRow>> baseReadFunc =
         deltaFormat.buildReaderWithPartitionValues(
             SparkSession.active(),
             dataSchema,
@@ -206,6 +396,31 @@ public class PartitionUtils {
             CollectionConverters.asScala(Arrays.asList(dataFilters)).toSeq(),
             optionsWithVectorizedReading,
             hadoopConf);
+
+    // For CDC reads, wrap the base ReadFunc with CDCReadFunc to override CDC columns
+    // (_change_type, _commit_version, _commit_timestamp) with per-file constants.
+    // All 3 CDC columns are in readDataSchema (added by ensureCDCColumnsInSchema).
+    // For columns not physically in the parquet file, the Parquet reader fills them with null
+    // (schema evolution). CDCReadFunc overrides those nulls with per-file constants.
+    Function1<PartitionedFile, Iterator<InternalRow>> readFunc = baseReadFunc;
+    if (isCDCRead) {
+      int changeTypeColIndex = -1;
+      int commitVersionColIndex = -1;
+      int commitTimestampColIndex = -1;
+      for (int i = 0; i < readDataSchema.fields().length; i++) {
+        String name = readDataSchema.fields()[i].name();
+        if (name.equals(SparkMicroBatchStream.CDC_TYPE_COLUMN)) {
+          changeTypeColIndex = i;
+        } else if (name.equals(SparkMicroBatchStream.CDC_COMMIT_VERSION)) {
+          commitVersionColIndex = i;
+        } else if (name.equals(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP)) {
+          commitTimestampColIndex = i;
+        }
+      }
+      readFunc =
+          new CDCReadFunc(
+              baseReadFunc, changeTypeColIndex, commitVersionColIndex, commitTimestampColIndex);
+    }
 
     return new SparkReaderFactory(readFunc, enableVectorizedReader);
   }

@@ -20,21 +20,22 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.execution.datasources.FilePartition;
 import org.apache.spark.sql.execution.datasources.PartitionedFile;
-import org.apache.spark.sql.execution.datasources.RecordReaderIterator;
 import scala.Function1;
 import scala.collection.Iterator;
 
 public class SparkPartitionReader<T> implements PartitionReader<T> {
-  // Function that produces a Spark RecordReaderIterator for a given file.
+  // Function that produces a record iterator for a given file.
+  // May be a base Parquet ReadFunc, or a decorated one (e.g., CDCReadFunc for CDC reads).
   private final Function1<PartitionedFile, Iterator<InternalRow>> readFunc;
   private final FilePartition partition;
 
   // Index of the next file to read within the partition.
   private int currentFileIndex = 0;
 
-  // Spark's readers return RecordReaderIterator for both row and columnar modes.
-  // Keep a reference so it can be closed when advancing to the next file.
-  private RecordReaderIterator<T> currentIterator = null;
+  // Iterator returned by readFunc.apply(file). May be a CDCOverrideIterator (for CDC)
+  // or a RecordReaderIterator (for non-CDC). We track Iterator<Object> because the actual
+  // element type is either InternalRow or ColumnarBatch depending on vectorization.
+  private Iterator<Object> currentIterator = null;
 
   public SparkPartitionReader(
       Function1<PartitionedFile, Iterator<InternalRow>> readFunc, FilePartition partition) {
@@ -50,35 +51,46 @@ public class SparkPartitionReader<T> implements PartitionReader<T> {
         return true;
       }
 
-      if (currentIterator != null) {
-        currentIterator.close();
-        currentIterator = null;
-      }
+      closeCurrentIterator();
 
       if (currentFileIndex >= partition.files().length) {
         return false;
       }
 
       final PartitionedFile file = partition.files()[currentFileIndex++];
+
       @SuppressWarnings("unchecked")
-      RecordReaderIterator<T> it = (RecordReaderIterator<T>) readFunc.apply(file);
+      Iterator<Object> it = (Iterator<Object>) (Iterator<?>) readFunc.apply(file);
       currentIterator = it;
     }
   }
 
   @Override
+  @SuppressWarnings("unchecked")
   public T get() {
     if (currentIterator == null) {
       throw new IllegalStateException("No current record. Call next() before get().");
     }
-    // RecordReaderIterator.next() returns the current record and advances the iterator.
-    return currentIterator.next();
+    return (T) currentIterator.next();
   }
 
   @Override
   public void close() throws IOException {
+    closeCurrentIterator();
+  }
+
+  /** Close the current iterator if it implements AutoCloseable. */
+  private void closeCurrentIterator() throws IOException {
     if (currentIterator != null) {
-      currentIterator.close();
+      if (currentIterator instanceof AutoCloseable) {
+        try {
+          ((AutoCloseable) currentIterator).close();
+        } catch (IOException e) {
+          throw e;
+        } catch (Exception e) {
+          throw new IOException(e);
+        }
+      }
       currentIterator = null;
     }
   }

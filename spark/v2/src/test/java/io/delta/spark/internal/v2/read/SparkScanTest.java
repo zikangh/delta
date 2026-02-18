@@ -294,10 +294,10 @@ public class SparkScanTest extends SparkDsv2TestBase {
 
   @Test
   public void testValidateStreamingOptions_UnsupportedOptions() {
-    // Test with blocked DeltaOptions, supported options, and custom user options
+    // Test with blocked DeltaOptions (ignoreChanges is not supported)
     Map<String, String> javaOptions = new HashMap<>();
     javaOptions.put("startingVersion", "0");
-    javaOptions.put("readChangeFeed", "true");
+    javaOptions.put("ignoreChanges", "true");
     javaOptions.put("myCustomOption", "value");
     scala.collection.immutable.Map<String, String> mixedOptions =
         ScalaUtils.toScalaMap(javaOptions);
@@ -311,9 +311,63 @@ public class SparkScanTest extends SparkDsv2TestBase {
     // Verify exact error message - only the blocked option should appear
     // Note: DeltaOptions uses CaseInsensitiveMap which lowercases keys during iteration
     assertEquals(
-        "The following streaming options are not supported: [readchangefeed]. "
-            + "Supported options are: [startingVersion, maxFilesPerTrigger, maxBytesPerTrigger].",
+        "The following streaming options are not supported: [ignorechanges]. "
+            + "Supported options are: [startingVersion, maxFilesPerTrigger, maxBytesPerTrigger, "
+            + "readChangeFeed, readChangeData].",
         exception.getMessage());
+  }
+
+  @Test
+  public void testValidateStreamingOptions_CDCOptions() {
+    // Test that readChangeFeed option is supported
+    Map<String, String> javaOptions = new HashMap<>();
+    javaOptions.put("startingVersion", "0");
+    javaOptions.put("readChangeFeed", "true");
+    javaOptions.put("myCustomOption", "value");
+    scala.collection.immutable.Map<String, String> cdcOptions = ScalaUtils.toScalaMap(javaOptions);
+    DeltaOptions deltaOptions = new DeltaOptions(cdcOptions, spark.sessionState().conf());
+
+    // Should not throw - readChangeFeed is now supported
+    SparkScan.validateStreamingOptions(deltaOptions);
+  }
+
+  @Test
+  public void testReadSchemaIncludesCDCColumns() {
+    // Test that readSchema includes CDC columns when readChangeFeed=true
+    Map<String, String> cdcOptions = new HashMap<>();
+    cdcOptions.put("readChangeFeed", "true");
+    CaseInsensitiveStringMap cdcOptionsMap = new CaseInsensitiveStringMap(cdcOptions);
+
+    SparkScanBuilder builder = (SparkScanBuilder) table.newScanBuilder(cdcOptionsMap);
+    SparkScan scan = (SparkScan) builder.build();
+
+    org.apache.spark.sql.types.StructType schema = scan.readSchema();
+
+    // Verify CDC columns are present
+    assertTrue(
+        schema.fieldIndex(SparkMicroBatchStream.CDC_TYPE_COLUMN) >= 0,
+        "Schema should contain " + SparkMicroBatchStream.CDC_TYPE_COLUMN);
+    assertTrue(
+        schema.fieldIndex(SparkMicroBatchStream.CDC_COMMIT_VERSION) >= 0,
+        "Schema should contain " + SparkMicroBatchStream.CDC_COMMIT_VERSION);
+    assertTrue(
+        schema.fieldIndex(SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP) >= 0,
+        "Schema should contain " + SparkMicroBatchStream.CDC_COMMIT_TIMESTAMP);
+  }
+
+  @Test
+  public void testReadSchemaWithoutCDCOption() {
+    // Test that readSchema does NOT include CDC columns when readChangeFeed is not set
+    SparkScanBuilder builder = (SparkScanBuilder) table.newScanBuilder(options);
+    SparkScan scan = (SparkScan) builder.build();
+
+    org.apache.spark.sql.types.StructType schema = scan.readSchema();
+
+    // Verify CDC columns are NOT present
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> schema.fieldIndex(SparkMicroBatchStream.CDC_TYPE_COLUMN),
+        "Schema should NOT contain " + SparkMicroBatchStream.CDC_TYPE_COLUMN);
   }
 
   // ================================================================================================
