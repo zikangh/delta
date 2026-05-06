@@ -385,6 +385,48 @@ public class V2RowTrackingReadTest extends DeltaV2TestBase {
     }
   }
 
+  /**
+   * Row tracking with a partition column declared in the MIDDLE of the DDL. Exercises the
+   * interaction between {@code RowTrackingReadFunction} (splices {@code _metadata} between data and
+   * partition columns) and {@code ColumnReorderReadFunction} (permutes data++partitions into DDL
+   * order). Without correct layering the row-mode path would emit values from the wrong column.
+   */
+  @Test
+  public void testReadWithRowTrackingAndPartitionColumnInMiddle(@TempDir File tempDir) {
+    String path = tempDir.getAbsolutePath();
+    spark.sql(
+        String.format(
+            "CREATE TABLE delta.`%s` (id LONG, part STRING, value DOUBLE) USING delta "
+                + "PARTITIONED BY (part) "
+                + "TBLPROPERTIES ('delta.enableRowTracking' = 'true')",
+            path));
+    spark.sql(
+        String.format(
+            "INSERT INTO delta.`%s` VALUES (1, 'a', 10.5), (2, 'b', 20.0), (3, 'a', 30.25)", path));
+
+    org.apache.spark.sql.Dataset<Row> df =
+        spark.sql(
+            String.format(
+                "SELECT id, part, value, _metadata.row_id FROM dsv2.delta.`%s` ORDER BY id", path));
+    assertArrayEquals(new String[] {"id", "part", "value", "row_id"}, df.schema().fieldNames());
+
+    List<Row> rows = df.collectAsList();
+    assertEquals(3, rows.size());
+    assertEquals(1L, rows.get(0).getLong(0));
+    assertEquals("a", rows.get(0).getString(1));
+    assertEquals(10.5d, rows.get(0).getDouble(2), 0.0d);
+    assertEquals(2L, rows.get(1).getLong(0));
+    assertEquals("b", rows.get(1).getString(1));
+    assertEquals(20.0d, rows.get(1).getDouble(2), 0.0d);
+    assertEquals(3L, rows.get(2).getLong(0));
+    assertEquals("a", rows.get(2).getString(1));
+    assertEquals(30.25d, rows.get(2).getDouble(2), 0.0d);
+    Set<Long> rowIds = new HashSet<>();
+    for (Row row : rows) {
+      assertTrue(rowIds.add(row.getLong(3)), "row_id should be unique");
+    }
+  }
+
   // ---------------------------------------------------------------------------
   //  Helpers
   // ---------------------------------------------------------------------------
