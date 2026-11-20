@@ -295,6 +295,9 @@ class DeltaV2Table private (
    */
   override def getTablePath(): Path = new Path(tablePath)
 
+  override def compositeId: (String, Path) =
+    initialSnapshotValue.metadata.getId -> initialSnapshotValue.dataPath
+
   /**
    * Returns the V2 identifier this table was constructed with.
    *
